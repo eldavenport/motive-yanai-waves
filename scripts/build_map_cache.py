@@ -22,6 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 import tpose24_io as io
 import wave_filter as wf
 import fluxes as fx
+import shear as sh
 
 FIELDS = ['UVEL', 'VVEL', 'WVEL', 'PHIHYD']
 N_READERS = 24
@@ -65,16 +66,46 @@ def main():
 
     arrs = load_all(iters)
 
-    # mask land to NaN, then band-pass each field to the Yanai band in place
-    print('masking land + band-passing', flush=True)
+    # mask land to NaN (do this BEFORE the mean/band-pass so land never mixes in)
     for f in FIELDS:
         arrs[f][:, land] = np.nan
+
+    # trim band-pass edge contamination at both ends (views, no copy)
+    sl = slice(k, len(iters) - k)
+
+    # --- background (time-mean) velocity + vertical shear, same window as the
+    # covariances --- computed from the RAW fields BEFORE the in-place band-pass
+    # (which would overwrite them). Saved as yanai_meanUV_maps_dt60.nc so the
+    # shear-vs-divergence maps can be built without a second full-domain pass.
+    print('computing background mean U/V + shear', flush=True)
+    Umean = np.nanmean(arrs['UVEL'][sl], axis=0).astype(np.float32)
+    Vmean = np.nanmean(arrs['VVEL'][sl], axis=0).astype(np.float32)
+    Sx0 = sh.vertical_shear(Umean, Z, zaxis=0)
+    Sy0 = sh.vertical_shear(Vmean, Z, zaxis=0)
+    S0 = sh.shear_magnitude(Sx0, Sy0)
+    xr.Dataset(
+        {'Umean': (['depth', 'y', 'x'], Umean),
+         'Vmean': (['depth', 'y', 'x'], Vmean),
+         'Sx0': (['depth', 'y', 'x'], Sx0.astype('f4')),
+         'Sy0': (['depth', 'y', 'x'], Sy0.astype('f4')),
+         'S0': (['depth', 'y', 'x'], S0.astype('f4'))},
+        coords={'depth': Z, 'lon': ('x', grid['lon']), 'lat': ('y', grid['lat']),
+                'drF': ('depth', drF)},
+        attrs={'units_vel': 'm s-1', 'units_shear': 's-1',
+               'window': 'spin-up dropped, edge-trim removed (matches cov3d)',
+               'spinup_days': io.SPINUP_DAYS, 'edge_trim_days': io.EDGE_TRIM_DAYS,
+               'run': io.RUN_DIR,
+               'note': 'time-mean raw UVEL/VVEL and background vertical shear'}
+    ).to_netcdf(os.path.join(io.CACHE_DIR, 'yanai_meanUV_maps_dt60.nc'))
+    print('saved yanai_meanUV_maps_dt60.nc', flush=True)
+
+    # band-pass each field to the Yanai band in place (land already masked)
+    print('band-passing', flush=True)
+    for f in FIELDS:
         t0 = time.time()
         wf.bandpass_inplace(arrs[f])
         print(f'  filtered {f}  ({time.time()-t0:.0f}s)', flush=True)
 
-    # trim band-pass edge contamination at both ends (views, no copy)
-    sl = slice(k, len(iters) - k)
     up, vp = arrs['UVEL'][sl], arrs['VVEL'][sl]
     wp = fx.w_to_center(arrs['WVEL'][sl], zaxis=1)         # faces -> centers
     pp = fx.RHO0 * arrs['PHIHYD'][sl]                      # pressure perturbation

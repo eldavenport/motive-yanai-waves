@@ -27,6 +27,7 @@ import xarray as xr
 import tpose6_io as io
 import wave_filter as wf
 import fluxes as fx
+import shear as sh
 import eos_jmd95 as eos
 
 fx.RHO0 = io.RHONIL                       # energy flux uses rhonil = 1035
@@ -67,8 +68,34 @@ def main():
     vp = load_subset('VVEL', iy, ix)
     wc = fx.w_faces_to_centers(load_subset('WVEL', iy, ix), zaxis=1).astype(np.float32)
 
-    # 3. mask land, band-pass in time (daily), each field in place
-    print('masking land + band-passing (15-40 d, daily)', flush=True)
+    # background (time-mean) velocity + shear over the SAME edge-trimmed window as
+    # the covariances -- from the RAW fields BEFORE the in-place band-pass. Saved as
+    # yanai_meanUV_maps_tp6.nc so the shear-vs-divergence maps need no extra pass.
+    up[:, land] = np.nan; vp[:, land] = np.nan
+    print('computing background mean U/V + shear', flush=True)
+    Umean = np.nanmean(up[etm], axis=0)
+    Vmean = np.nanmean(vp[etm], axis=0)
+    Sx0 = sh.vertical_shear(Umean, Z, zaxis=0)
+    Sy0 = sh.vertical_shear(Vmean, Z, zaxis=0)
+    S0 = sh.shear_magnitude(Sx0, Sy0)
+    xr.Dataset(
+        {'Umean': (['depth', 'y', 'x'], Umean.astype('f4')),
+         'Vmean': (['depth', 'y', 'x'], Vmean.astype('f4')),
+         'Sx0': (['depth', 'y', 'x'], Sx0.astype('f4')),
+         'Sy0': (['depth', 'y', 'x'], Sy0.astype('f4')),
+         'S0': (['depth', 'y', 'x'], S0.astype('f4'))},
+        coords={'depth': Z, 'lon': ('x', lon), 'lat': ('y', lat),
+                'drF': ('depth', drF)},
+        attrs={'units_vel': 'm s-1', 'units_shear': 's-1',
+               'window': 'edge-trim removed, no spin-up drop (matches cov3d_tp6)',
+               'edge_trim_days': io.EDGE_TRIM_DAYS, 'run': io.DATA_DIR,
+               'map_lon': str(io.MAP_LON), 'map_lat': str(io.MAP_LAT),
+               'note': 'time-mean raw UVEL/VVEL and background vertical shear'}
+    ).to_netcdf(os.path.join(io.CACHE_DIR, 'yanai_meanUV_maps_tp6.nc'))
+    print('saved yanai_meanUV_maps_tp6.nc', flush=True)
+
+    # 3. band-pass in time (daily), each field in place (land already masked on U/V)
+    print('band-passing (15-40 d, daily)', flush=True)
     for name, arr in (('UVEL', up), ('VVEL', vp), ('WVEL', wc), ('PHIHYD', phi)):
         arr[:, land] = np.nan
         ts = time.time()
