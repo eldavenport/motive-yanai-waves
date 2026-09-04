@@ -38,6 +38,7 @@ N_LEVELS = 100
 import wave_filter as wf
 import fluxes as fx
 import shear as sh
+import stats_corr as sc
 
 REPO = '/home/edavenport/analysis/motive-yanai-waves'
 
@@ -49,6 +50,12 @@ MODELS = {
                     meanuv='yanai_meanUV_maps_tp6.nc',
                     fig_dir=f'{REPO}/figures/tpose6', spinup=False,
                     w_on_faces=False),
+    # 5-year TPOSE6 "noVel" run (raw mds, 2012-2016); depth-time contours only.
+    'tpose6_noVel_5year': dict(io='tpose6_noVel_5year_io',
+                    cache='yanai_mooring_tp6_noVel_5yr.nc',
+                    meanuv='yanai_meanUV_maps_tp6_noVel_5yr.nc',
+                    fig_dir=f'{REPO}/figures/tpose6_noVel_5year', spinup=False,
+                    w_on_faces=False, contours_only=True),
 }
 
 # depth ranges (m, positive down) requested for the panels
@@ -615,6 +622,307 @@ def make_hprod_hovmoller_AC(M, grads, zr, subset=(0, 2), win=1, out_dir=None,
     return fname
 
 
+# vertical-shear (barotropic) production row labels, shared across compare figs
+PROD_LBL = {'U': r"$-\langle u'w'\rangle\,\partial_z\langle U\rangle$",
+            'V': r"$-\langle v'w'\rangle\,\partial_z\langle V\rangle$"}
+
+
+def _load_tpose6_pair(loaded):
+    """The tpose6 (Vel) and tpose6_noVel_5year models, from `loaded` or cache.
+
+    Returns {model: M} or None if either mooring cache is missing.
+    """
+    loaded = loaded or {}
+    M = {}
+    for m in ('tpose6', 'tpose6_noVel_5year'):
+        if m in loaded:
+            M[m] = loaded[m]
+        else:
+            cfg = MODELS[m]
+            path = (f"{importlib.import_module(cfg['io']).CACHE_DIR}/"
+                    f"{cfg['cache']}")
+            if not os.path.exists(path):
+                print(f'SKIP tpose6 compare: {m} cache missing ({cfg["cache"]})')
+                return None
+            M[m] = load_model(cfg)
+    return M
+
+
+def _sem_neff(series):
+    """(mean, SEM) over time for a (time, depth) series, per depth.
+
+    SEM = std / sqrt(N_eff) with the AR(1) effective sample size
+    N_eff = N (1-a1)/(1+a1) (a1 = lag-1 autocorrelation), so the daily samples'
+    serial correlation is not counted as independent DOF (see stats_corr).
+    """
+    mean = np.nanmean(series, 0)
+    std = np.nanstd(series, 0)
+    sem = np.full(series.shape[1], np.nan)
+    for k in range(series.shape[1]):
+        col = series[:, k]
+        col = col[np.isfinite(col)]
+        if col.size < 4:
+            continue
+        a1 = sc.lag1_autocorr(col)
+        neff = max(3.0, col.size * (1 - a1) / (1 + a1))
+        sem[k] = std[k] / np.sqrt(neff)
+    return mean, sem
+
+
+def _prod_profiles(M, t0, t1, moorings=(0, 2)):
+    """Vertical-shear production profiles with SEM per (model, mooring, comp).
+
+    production(z) = mean_t[ -u'(t,z)w'(t,z) ] * d<comp>/dz(z), over the window
+    [t0, t1]; SEM from _sem_neff. Returns {(model, p, comp): (P, sem, zz)} masked
+    to the PROFILE_ZMIN..PROFILE_ZMAX depth range.
+    """
+    prof = {}
+    for mname in M:
+        Mi = M[mname]
+        Z = Mi['Z']
+        zmask = (-Z >= PROFILE_ZMIN) & (-Z <= PROFILE_ZMAX)
+        r = restrict_unfiltered(Mi, t0, t1)
+        for p in moorings:
+            for comp in ('U', 'V'):
+                vk = comp.lower()
+                S = sh.vertical_shear(r['mean'][comp][p], Z)
+                pser = -(r['unfilt'][vk][:, p, :]
+                         * r['unfilt']['w'][:, p, :]) * S[None, :]
+                P, sem = _sem_neff(pser)
+                prof[(mname, p, comp)] = (P[zmask], sem[zmask], Z[zmask])
+    return prof
+
+
+def _interp_prof(zz_src, y_src, zz_dst):
+    """Interpolate a profile from depths zz_src onto zz_dst (no extrapolation)."""
+    return np.interp(-zz_dst, -zz_src, y_src, left=np.nan, right=np.nan)
+
+
+def make_prod_diff_AC(loaded=None):
+    """Change in vertical-shear production (noVel − Vel) at moorings A & C.
+
+    2 rows (U, V production) x 2 columns (A, C). Each panel: the difference
+    profile noVel − Vel with its +/-1 SEM band (SEM_diff = sqrt(SEM_Vel^2 +
+    SEM_noVel^2), the runs treated as independent); depths where |diff| exceeds
+    SEM_diff (band clears zero) are marked -- there the change is robust, elsewhere
+    it is within noise. noVel is interpolated onto the Vel depth grid. Over the
+    shorter tpose6 (Vel) window. -> tpose6_compare/
+    """
+    from matplotlib.lines import Line2D
+    M = _load_tpose6_pair(loaded)
+    if M is None:
+        return
+    t0, t1 = M['tpose6']['time'][0], M['tpose6']['time'][-1]
+    moorings = [0, 2]
+    prof = _prod_profiles(M, t0, t1, moorings)
+
+    out_dir = f'{REPO}/figures/tpose6_compare'
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), sharey=True)
+    for ri, comp in enumerate(('U', 'V')):
+        diffs = {}
+        for p in moorings:
+            Pv, semv, zzv = prof[('tpose6', p, comp)]
+            Pn, semn, zzn = prof[('tpose6_noVel_5year', p, comp)]
+            d = _interp_prof(zzn, Pn, zzv) - Pv
+            sd = np.sqrt(semv ** 2 + _interp_prof(zzn, semn, zzv) ** 2)
+            diffs[p] = (d, sd, zzv)
+        env = np.concatenate([np.abs(diffs[p][0]) + diffs[p][1] for p in moorings])
+        vmax = np.nanpercentile(env, 90) if np.isfinite(env).any() else 0.0
+        for cix, p in enumerate(moorings):
+            d, sd, zz = diffs[p]
+            ax = axes[ri, cix]
+            ax.fill_betweenx(zz, d - sd, d + sd, color='0.6', alpha=0.3)
+            ax.plot(d, zz, 'k-', marker='.', ms=3)
+            sig = np.abs(d) > sd                       # band clears zero
+            ax.plot(np.where(sig, d, np.nan), zz, 'o', color='crimson', ms=4)
+            ax.axvline(0, color='0.4', lw=0.8)
+            ax.ticklabel_format(axis='x', style='sci', scilimits=(-2, 2))
+            if np.isfinite(vmax) and vmax > 0:
+                ax.set_xlim(-vmax, vmax)
+            if ri == 0:
+                ax.set_title(_moor_label(M['tpose6']['names'][p]), fontsize=11)
+            if ri == 1:
+                ax.set_xlabel('Δ production (m$^2$ s$^{-3}$)')
+        axes[ri, 0].set_ylabel(f'{comp}: noVel − Vel  {PROD_LBL[comp]}\ndepth (m)',
+                               fontsize=10)
+    axes[0, 0].set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
+    axes[0, 0].legend([Line2D([], [], color='crimson', marker='o', ls='none')],
+                      ['|Δ| > SEM (robust)'], fontsize=9, loc='lower left')
+    fig.suptitle('Change in vertical-shear production (noVel − Vel) — A & C '
+                 '(±1 SEM, N_eff) over '
+                 f'{str(t0)[:10]} .. {str(t1)[:10]}', y=0.99)
+    fig.tight_layout()
+    fname = f'{out_dir}/mooring_prod_diff_AC.png'
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    print('wrote', fname)
+    return fname
+
+
+def make_prod_compare_AC(loaded=None):
+    """Vertical-shear production profiles at moorings A & C, comparing the two
+    TPOSE6 runs (velocity-assimilating "tpose6" vs 5-year "noVel") over the
+    shorter tpose6 record so the comparison isolates dynamics from record length.
+
+    2 rows x 4 columns: rows are U production -<u'w'> d<U>/dz and V production
+    -<v'w'> d<V>/dz; columns are A-Vel, A-noVel, C-Vel, C-noVel. Mooring is
+    encoded by color (A black, C red). x-limits are shared per row so the four
+    columns are directly comparable. Unfiltered (total) perturbations; only the
+    vertical-shear production (no horizontal/barotropic uv/vv terms). -> tpose6_compare/
+    """
+    M = _load_tpose6_pair(loaded)
+    if M is None:
+        return
+    t0, t1 = M['tpose6']['time'][0], M['tpose6']['time'][-1]   # shorter window
+    moorings = [0, 2]                                          # A, C
+    prof = _prod_profiles(M, t0, t1, moorings)                 # (m,p,comp)->(P,sem,zz)
+
+    # Vel & noVel overlaid in each panel (distinguished by color + style + marker);
+    # panels faceted by component (rows U/V) and mooring (columns A/C). Shading is
+    # the +/-1 SEM band on the mean (autocorrelation-corrected N_eff): non-overlap
+    # of the two bands => the change in mean production is robust. One legend.
+    from matplotlib.lines import Line2D
+    mstyle = {'tpose6': dict(ls='-', marker='o', ms=3, markevery=3,
+                             color='tab:blue'),
+              'tpose6_noVel_5year': dict(ls='--', marker='s', ms=3, markevery=3,
+                                         color='tab:red')}
+    disp = {'tpose6': 'tpose6-Vel', 'tpose6_noVel_5year': 'tpose6-noVel'}
+    comps = ('U', 'V')
+
+    out_dir = f'{REPO}/figures/tpose6_compare'
+    os.makedirs(out_dir, exist_ok=True)
+    fig, axes = plt.subplots(2, 2, figsize=(11, 9), sharey=True)
+    for ri, comp in enumerate(comps):
+        # scale to the 90th pct of the mean+/-SEM envelope (not its max) so the
+        # near-surface variability spike doesn't flatten the deeper mean profiles.
+        env = np.concatenate([np.abs(prof[(m, p, comp)][0]) + prof[(m, p, comp)][1]
+                              for m in mstyle for p in moorings])
+        vmax = np.nanpercentile(env, 90) if np.isfinite(env).any() else 0.0
+        for cix, p in enumerate(moorings):
+            ax = axes[ri, cix]
+            for mname in mstyle:
+                P, sem, zz = prof[(mname, p, comp)]
+                ax.fill_betweenx(zz, P - sem, P + sem,
+                                 color=mstyle[mname]['color'], alpha=0.18)
+                ax.plot(P, zz, **mstyle[mname])
+            ax.axvline(0, color='0.6', lw=0.5)
+            ax.ticklabel_format(axis='x', style='sci', scilimits=(-2, 2))
+            if np.isfinite(vmax) and vmax > 0:
+                ax.set_xlim(-vmax, vmax)
+            if ri == 0:
+                ax.set_title(_moor_label(M['tpose6']['names'][p]), fontsize=11)
+            if ri == 1:
+                ax.set_xlabel('production (m$^2$ s$^{-3}$)')
+        axes[ri, 0].set_ylabel(f'{comp} production {PROD_LBL[comp]}\ndepth (m)',
+                               fontsize=10)
+    axes[0, 0].set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
+    legend_h = [Line2D([], [], **mstyle[m]) for m in mstyle]
+    axes[0, 0].legend(legend_h, [disp[m] for m in mstyle], fontsize=9,
+                      loc='lower left')
+    fig.suptitle('Vertical-shear production — TPOSE6 Vel vs noVel — A & C '
+                 '(shaded ±1 SEM, N_eff) over '
+                 f'{str(t0)[:10]} .. {str(t1)[:10]}', y=0.99)
+    fig.tight_layout()
+    fname = f'{out_dir}/mooring_prod_compare_AC.png'
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    print('wrote', fname)
+    return fname
+
+
+def _restrict_model(M, t0, t1):
+    """A load_model-shaped dict restricted to [t0, t1] (window mean + anomalies).
+
+    Reuses restrict_unfiltered so the unfiltered perturbations are re-referenced
+    to the sub-window; only the unfiltered treatment is needed for the profile
+    hovmoller compare.
+    """
+    tmask = (M['time'] >= t0) & (M['time'] <= t1)
+    r = restrict_unfiltered(M, t0, t1)
+    return {'Z': M['Z'], 'time': M['time'][tmask], 'names': M['names'],
+            'mean': r['mean'], 'treat': {'unfiltered': r['unfilt']}}
+
+
+def make_profile_hovmoller_compare(Mr, t0, t1, comp, zr, win=1, out_dir=None,
+                                   avg_tag=''):
+    """4-column depth-time compare of the profile quantities for one component.
+
+    Columns are A-Vel, A-noVel, C-Vel, C-noVel (mooring A in the first two, C in
+    the last two); rows are the four profile quantities (velocity, shear, flux,
+    production -- see _profile_fields). Color limits are shared per row across all
+    four columns so Vel vs noVel is directly comparable. Both models restricted to
+    the shorter tpose6 (Vel) window; unfiltered perturbations. `win` (samples) is a
+    centered moving average along time. -> tpose6_compare/
+    """
+    cols = [('tpose6', 0), ('tpose6_noVel_5year', 0),
+            ('tpose6', 2), ('tpose6_noVel_5year', 2)]
+    disp = {'tpose6': 'tpose6-Vel', 'tpose6_noVel_5year': 'tpose6-noVel'}
+    rlabels = _profile_rlabels(comp)
+    zmin, zmax, zlab = zr
+
+    fields = [_profile_fields(Mr[m], p, comp, win) for m, p in cols]
+    xts = [mdates.date2num(Mr[m]['time']) for m, _ in cols]
+    Zs = [Mr[m]['Z'] for m, _ in cols]
+    zmasks = [(-Z >= zmin) & (-Z <= zmax) for Z in Zs]
+
+    nrows = len(rlabels)
+    fig, axes = plt.subplots(nrows, 4, figsize=(17, 11), sharey=True,
+                             layout='constrained')
+    xt0, xt1 = mdates.date2num(t0), mdates.date2num(t1)
+    for r in range(nrows):
+        panels = [fields[c][r][:, zmasks[c]] for c in range(4)]      # (time, nz)
+        v = _autoscale(np.concatenate([P.ravel() for P in panels]))
+        for c in range(4):
+            zz = Zs[c][zmasks[c]]
+            cs = _contourf(axes[r, c], xts[c], zz, panels[c].T, v)
+            axes[r, c].set_xlim(xt0, xt1)
+        axes[r, 0].set_ylabel(rlabels[r] + '\ndepth (m)', fontsize=9)
+        _add_colorbar(fig, cs, list(axes[r]), v)
+    for r in range(nrows - 1):                          # date labels bottom row only
+        for c in range(4):
+            axes[r, c].tick_params(labelbottom=False)
+    for c, (m, p) in enumerate(cols):
+        axes[0, c].set_title(f"{disp[m]}\n{_moor_label(Mr[m]['names'][p])}",
+                             fontsize=10)
+        axes[-1, c].set_xlabel('time')
+        for lbl in axes[-1, c].get_xticklabels():
+            lbl.set_rotation(30)
+            lbl.set_horizontalalignment('right')
+    axes[0, 0].set_ylim(-zmax, -zmin)
+    fig.suptitle(f'Moorings A & C — Vel vs noVel — {comp} profile ({zlab})'
+                 f'{avg_tag}  [{str(t0)[:10]} .. {str(t1)[:10]}]')
+    fname = (f"{out_dir or REPO + '/figures/tpose6_compare'}/"
+             f"mooring_AC_compare_{comp}_profile_hovmoller_{zlab}.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    print('wrote', fname)
+    return fname
+
+
+def make_hovmoller_compare_all(loaded=None):
+    """A&C profile hovmoller compare (Vel vs noVel, U & V) over the tpose6 window,
+    drawn raw and at the 14/25/40-day moving-average windows (subfolders)."""
+    M = _load_tpose6_pair(loaded)
+    if M is None:
+        return
+    t0, t1 = M['tpose6']['time'][0], M['tpose6']['time'][-1]
+    Mr = {m: _restrict_model(M[m], t0, t1) for m in M}
+    prof_range = (PROFILE_ZMIN, PROFILE_ZMAX, '300-1500m')
+    dt_days = float(np.median(np.diff(Mr['tpose6']['time'])) / np.timedelta64(1, 'D'))
+    base = f'{REPO}/figures/tpose6_compare'
+    os.makedirs(base, exist_ok=True)
+    for comp in ('U', 'V'):
+        make_profile_hovmoller_compare(Mr, t0, t1, comp, prof_range, 1, base, '')
+    for days in (14, 25, 40):
+        win = max(1, round(days / dt_days))
+        od = f'{base}/{days}day_mov_avg'
+        os.makedirs(od, exist_ok=True)
+        for comp in ('U', 'V'):
+            make_profile_hovmoller_compare(Mr, t0, t1, comp, prof_range, win, od,
+                                           f' — {days}-day avg')
+
+
 def make_compare_all(loaded):
     """Cross-model A&C profile comparison over the tpose24 window (both comps)."""
     M = {}
@@ -653,15 +961,17 @@ def main(models=None):
                     for zr in DEPTH_RANGES:
                         make_fig(M, p, comp, treat, zr)
                         n += 1
-        for comp in ('U', 'V'):                       # mean-profile figures
-            make_profile_fig(M, comp)                  # all moorings
-            make_profile_fig(M, comp, subset=[0, 2], tag='_AC')  # A & C only
-            n += 2
+        if not cfg.get('contours_only'):
+            for comp in ('U', 'V'):                   # mean-profile line figures
+                make_profile_fig(M, comp)              # all moorings
+                make_profile_fig(M, comp, subset=[0, 2], tag='_AC')  # A & C only
+                n += 2
         # horizontal shear-production profiles (needs mean-U/V map cache)
         _, grads = load_mean_gradients(cfg, M['lon'], M['lat'])
-        make_hprod_fig(M, grads)
-        make_hprod_fig(M, grads, subset=[0, 2], tag='_AC')
-        n += 2
+        if not cfg.get('contours_only'):
+            make_hprod_fig(M, grads)
+            make_hprod_fig(M, grads, subset=[0, 2], tag='_AC')
+            n += 2
         # depth-time contour counterparts of the mean-profile figures, drawn raw
         # and at three moving-average windows (subfolders). dt from the record.
         prof_range = (PROFILE_ZMIN, PROFILE_ZMAX, '300-1500m')
@@ -693,6 +1003,9 @@ def main(models=None):
         print(f'{model}: wrote {n} figures to {cfg["fig_dir"]}')
 
     make_compare_all(loaded)
+    make_prod_compare_AC(loaded)
+    make_prod_diff_AC(loaded)
+    make_hovmoller_compare_all(loaded)
 
 
 if __name__ == '__main__':
