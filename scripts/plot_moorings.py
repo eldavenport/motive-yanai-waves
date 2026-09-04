@@ -24,6 +24,7 @@ Figures -> figures/ (TPOSE24) and figures/tpose6/ (TPOSE6).
 import os
 import importlib
 import numpy as np
+import pandas as pd
 import xarray as xr
 import matplotlib
 matplotlib.use('Agg')
@@ -175,6 +176,93 @@ def make_profile_fig(M, comp, subset=None, tag=''):
     return fname
 
 
+def restrict_unfiltered(M, t0, t1):
+    """Re-reference the unfiltered perturbations and mean flow to [t0, t1].
+
+    The cached `unfiltered` perturbation is an anomaly from the FULL analysis
+    window; here we restrict to the sub-window t0..t1 and re-subtract the
+    sub-window mean (so the covariance is taken over exactly this window). The
+    stored per-mooring mean velocity is likewise shifted by the sub-window mean
+    of the anomaly, so `mean[comp]` is the time-mean over t0..t1. No raw
+    velocities are needed -- everything follows from the stored anomaly + mean.
+    """
+    tmask = (M['time'] >= t0) & (M['time'] <= t1)
+    d = M['treat']['unfiltered']
+    unfilt, mean = {}, {}
+    for vk in ('u', 'v', 'w'):
+        p = d[vk][tmask]
+        unfilt[vk] = p - np.nanmean(p, 0, keepdims=True)
+    for comp in ('U', 'V'):
+        mean[comp] = M['mean'][comp] + np.nanmean(d[comp.lower()][tmask], 0)
+    return dict(mean=mean, unfilt=unfilt, n=int(tmask.sum()))
+
+
+def make_profile_compare(M, comp, subset=(0, 2)):
+    """Overlay A & C mean profiles from tpose24 and tpose6 over the tpose24 window.
+
+    Four columns, each its own x-axis: mean velocity <comp>, mean shear
+    d<comp>/dz, vertical Reynolds stress -<comp'w'>, and shear production
+    -<comp'w'> d<comp>/dz. Both models are restricted to the tpose24 record so
+    the comparison isolates dynamics from record length. Mooring is encoded by
+    color (A black, C red); model by line style (tpose24 solid, tpose6 dashed).
+    No titles. Unfiltered (total) perturbations only.
+    """
+    from matplotlib.lines import Line2D
+    M24 = M['tpose24']
+    t0, t1 = M24['time'][0], M24['time'][-1]
+    vk = comp.lower()
+    # model -> line style: tpose24 solid, tpose6 dashed (mooring is the color)
+    styles = {'tpose24': dict(ls='-', lw=2.2),
+              'tpose6':  dict(ls='--', lw=1.3)}
+    ns = {}
+
+    fig, (ax0, ax1, ax2, ax3) = plt.subplots(1, 4, figsize=(14, 6.5),
+                                             sharey=True)
+    for mname in ('tpose24', 'tpose6'):
+        Mi = M[mname]
+        r = restrict_unfiltered(Mi, t0, t1)
+        ns[mname] = r['n']
+        Z = Mi['Z']
+        zmask = (-Z >= PROFILE_ZMIN) & (-Z <= PROFILE_ZMAX)
+        zz = Z[zmask]
+        st = styles[mname]
+        for p in subset:
+            c = MOORING_COLORS[p]
+            vel = r['mean'][comp][p]
+            S = sh.vertical_shear(vel, Z)
+            F = -np.nanmean(r['unfilt'][vk][:, p, :] * r['unfilt']['w'][:, p, :], 0)
+            P = F * S
+            ax0.plot(vel[zmask], zz, color=c, **st)
+            ax1.plot(S[zmask], zz, color=c, **st)
+            ax2.plot(F[zmask], zz, color=c, **st)
+            ax3.plot(P[zmask], zz, color=c, **st)
+
+    for ax in (ax0, ax1, ax2, ax3):
+        ax.axvline(0, color='0.6', lw=0.5)
+        ax.ticklabel_format(axis='x', style='sci', scilimits=(-2, 2))
+    ax0.set_xlabel(f'$\\langle {comp}\\rangle$ (m s$^{{-1}}$)')
+    ax1.set_xlabel(f"$\\partial_z\\langle {comp}\\rangle$ (s$^{{-1}}$)")
+    ax2.set_xlabel(f"$-\\langle {vk}'w'\\rangle$ (m$^2$ s$^{{-2}}$)")
+    ax3.set_xlabel('production (m$^2$ s$^{-3}$)')
+    ax0.set_ylabel('depth (m)')
+    # two legends: mooring by color, model by line style
+    moor_h = [Line2D([], [], color=MOORING_COLORS[p], lw=2) for p in subset]
+    moor_l = [_moor_label(M24['names'][p]) for p in subset]
+    model_h = [Line2D([], [], color='0.3', **styles[m])
+               for m in ('tpose24', 'tpose6')]
+    model_l = [f"tpose24 (n={ns['tpose24']})", f"tpose6 (n={ns['tpose6']})"]
+    leg1 = ax0.legend(moor_h, moor_l, fontsize=8, loc='lower left',
+                      title='mooring')
+    ax0.add_artist(leg1)
+    ax0.legend(model_h, model_l, fontsize=8, loc='lower right', title='model')
+    ax0.set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
+    fig.tight_layout()
+    fname = f'{REPO}/figures/mooring_profiles_{comp}_compare_t24window.png'
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
 def load_mean_gradients(cfg, mlon, mlat):
     """Horizontal gradients of the time-mean flow at each mooring point.
 
@@ -250,6 +338,67 @@ def make_hprod_fig(M, grads, subset=None, tag=''):
     return fname
 
 
+def _movavg(F, win):
+    """Centered NaN-aware moving average of (time, depth) `F` along time.
+
+    `win` is the window in samples; win<=1 returns F unchanged. Below-bathymetry
+    depths are all-NaN columns and stay NaN; edges shrink the window.
+    """
+    if win <= 1:
+        return F
+    return pd.DataFrame(F).rolling(win, center=True, min_periods=1).mean().values
+
+
+def _autoscale(F):
+    """Symmetric 98th-percentile color limit of |F| (as make_fig uses)."""
+    fin = np.abs(F[np.isfinite(F)])
+    v = np.nanpercentile(fin, 98) if fin.size else 1.0
+    return v if v > 0 else 1.0
+
+
+def _contourf(ax, xt, zz, F, v):
+    """Draw one RdBu_r depth-time filled-contour field with +/- v limits."""
+    levels = np.linspace(-v, v, N_LEVELS + 1)        # 100 filled contour bands
+    cs = ax.contourf(xt, zz, F, levels=levels, cmap='RdBu_r', extend='both')
+    ax.xaxis_date()
+    return cs
+
+
+def _add_colorbar(fig, cs, ax, v):
+    """Attach a colorbar to `ax` (an axis or list of axes) with +/- v ticks.
+
+    The power of ten is folded into a side label so the ScalarFormatter offset
+    text ("1e-X") can't overlap the panel.
+    """
+    cb = fig.colorbar(cs, ax=ax, pad=0.01, shrink=0.9,
+                      ticks=np.linspace(-v, v, 9))
+    exp = int(np.floor(np.log10(v))) if v > 0 else 0
+    if exp < -2 or exp >= 3:
+        s = 10.0 ** exp
+        cb.ax.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda t, _, s=s: f'{t/s:.1f}'))
+        cb.set_label(f'$\\times10^{{{exp}}}$', fontsize=8)
+    else:
+        cb.ax.yaxis.set_major_formatter(
+            mticker.FuncFormatter(lambda t, _: f'{t:g}'))
+    return cb
+
+
+def _contour_panel(fig, ax, xt, zz, F, rlabel, v=None):
+    """Draw one depth-time filled-contour panel with its own colorbar.
+
+    `F` is (nz, n_time). If `v` is None the panel auto-scales to the symmetric
+    98th percentile of |F| (as make_fig does for the product panels); otherwise
+    `v` sets the fixed +/- color limit.
+    """
+    if v is None:
+        v = _autoscale(F)
+    cs = _contourf(ax, xt, zz, F, v)
+    ax.set_ylabel(rlabel + '\ndepth (m)', fontsize=9)
+    _add_colorbar(fig, cs, ax, v)
+    return cs
+
+
 def make_fig(M, p, comp, treat, zr):
     d = M['treat'][treat]
     up, vp, wp = d['u'][:, p, :], d['v'][:, p, :], d['w'][:, p, :]
@@ -266,29 +415,7 @@ def make_fig(M, p, comp, treat, zr):
     fig, axes = plt.subplots(3, 1, figsize=(10, 8.5), sharex=True)
     for ax, (rlabel, key) in zip(axes, FIGS[comp]):
         F = fields[key][:, zmask].T                  # (nz_sel, n_time)
-        if key in clim:
-            v = clim[key]
-        else:                                        # products: auto-scale
-            fin = np.abs(F[np.isfinite(F)])
-            v = np.nanpercentile(fin, 98) if fin.size else 1.0
-            v = v if v > 0 else 1.0
-        levels = np.linspace(-v, v, N_LEVELS + 1)    # 100 filled contour bands
-        cs = ax.contourf(xt, zz, F, levels=levels, cmap='RdBu_r', extend='both')
-        ax.xaxis_date()
-        ax.set_ylabel(rlabel + '\ndepth (m)', fontsize=9)
-        cb = fig.colorbar(cs, ax=ax, pad=0.01, shrink=0.9,
-                          ticks=np.linspace(-v, v, 9))
-        # avoid the ScalarFormatter offset text (the "1e-X") that overlaps the
-        # panel: fold the power of ten into a side label instead
-        exp = int(np.floor(np.log10(v))) if v > 0 else 0
-        if exp < -2 or exp >= 3:
-            s = 10.0 ** exp
-            cb.ax.yaxis.set_major_formatter(
-                mticker.FuncFormatter(lambda t, _, s=s: f'{t/s:.1f}'))
-            cb.set_label(f'$\\times10^{{{exp}}}$', fontsize=8)
-        else:
-            cb.ax.yaxis.set_major_formatter(
-                mticker.FuncFormatter(lambda t, _: f'{t:g}'))
+        _contour_panel(fig, ax, xt, zz, F, rlabel, v=clim.get(key))
     axes[-1].set_xlabel('time')
     fig.suptitle(f'Mooring {name[0]} ({label}) — {treat} — {comp} '
                  f'({zlab})', y=0.997)
@@ -300,7 +427,214 @@ def make_fig(M, p, comp, treat, zr):
     return fname
 
 
+# horizontal shear-production columns: label, stress key, mean-gradient key
+HPROD_COLS = [
+    (r"$-\langle v'v'\rangle\,\partial_y\langle V\rangle$ (m$^2$ s$^{-3}$)",
+     'vv', 'dVdy'),
+    (r"$-\langle u'v'\rangle\,\partial_y\langle U\rangle$ (m$^2$ s$^{-3}$)",
+     'uv', 'dUdy'),
+    (r"$-\langle u'v'\rangle\,\partial_x\langle V\rangle$ (m$^2$ s$^{-3}$)",
+     'uv', 'dVdx')]
+
+
+def _profile_rlabels(comp):
+    """Row labels for the vertical-profile hovmoller (matches make_profile_fig)."""
+    vk = comp.lower()
+    return [f'$\\langle {comp}\\rangle$ (m s$^{{-1}}$)',
+            f'$\\partial_z\\langle {comp}\\rangle$ (s$^{{-1}}$)',
+            f"$-\\langle {vk}'w'\\rangle$ (m$^2$ s$^{{-2}}$)",
+            f"production $-\\langle {vk}'w'\\rangle\\,"
+            f"\\partial_z\\langle {comp}\\rangle$ (m$^2$ s$^{{-3}}$)"]
+
+
+def _profile_fields(M, p, comp, win=1):
+    """The four (time, depth) profile-hovmoller fields for mooring p.
+
+    Velocity is the raw total <comp> = mean + anomaly and is NEVER averaged (the
+    background flow is shown at full resolution). Shear = MA(d(vel)/dz), flux =
+    MA(-comp'w'), and production = MA(shear) * MA(flux) all use a centered
+    `win`-sample moving average -- production uses the moving-average shear
+    (matching the shear panel), not the mean shear. Unfiltered perturbations.
+    """
+    vk = comp.lower()
+    Z = M['Z']
+    d = M['treat']['unfiltered']
+    vel_t = M['mean'][comp][p][None, :] + d[vk][:, p, :]        # raw total vel
+    shear_ma = _movavg(sh.vertical_shear(vel_t, Z, zaxis=-1), win)
+    flux_ma = _movavg(-(d[vk][:, p, :] * d['w'][:, p, :]), win)
+    prod = shear_ma * flux_ma                                  # MA shear * MA flux
+    return [vel_t, shear_ma, flux_ma, prod]
+
+
+def _hprod_field(M, grads, p, sk, gk):
+    """One horizontal-production (time, depth) field: -<sk>(z,t) * mean grad gk."""
+    d = M['treat']['unfiltered']
+    up, vp = d['u'][:, p, :], d['v'][:, p, :]
+    stress = -(up * vp) if sk == 'uv' else -(vp * vp)
+    return stress * grads[p][gk][None, :]
+
+
+def make_profile_hovmoller(M, p, comp, zr, win=1, out_dir=None, avg_tag=''):
+    """Depth-time contour version of make_profile_fig for one mooring/component.
+
+    Four stacked depth-time panels whose time-averages reproduce the mean-profile
+    figure (see _profile_fields). Unfiltered perturbations. `win` (samples)
+    applies a centered moving average along time.
+    """
+    Z = M['Z']
+    zmin, zmax, zlab = zr
+    zmask = (-Z >= zmin) & (-Z <= zmax)
+    zz = Z[zmask]
+    name = M['names'][p]
+    label = name.split('_', 1)[1].replace('_', ' ')
+
+    fields = _profile_fields(M, p, comp, win)
+    rlabels = _profile_rlabels(comp)
+    xt = mdates.date2num(M['time'])
+    fig, axes = plt.subplots(4, 1, figsize=(10, 10), sharex=True)
+    for ax, rlabel, F in zip(axes, rlabels, fields):
+        _contour_panel(fig, ax, xt, zz, F[:, zmask].T, rlabel)
+    axes[-1].set_xlabel('time')
+    fig.suptitle(f'Mooring {name[0]} ({label}) — unfiltered — {comp} '
+                 f'profile ({zlab}){avg_tag}', y=0.997)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fname = (f"{out_dir or M['fig_dir']}/"
+             f"mooring_{name}_{comp}_profile_hovmoller_{zlab}.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
+def make_hprod_hovmoller(M, grads, p, zr, win=1, out_dir=None, avg_tag=''):
+    """Depth-time contour version of make_hprod_fig for one mooring.
+
+    Three stacked depth-time panels of horizontal (barotropic) shear production
+    (see HPROD_COLS / _hprod_field); each panel's time average reproduces the
+    mean-profile figure. Unfiltered perturbations. `win` (samples) applies a
+    centered moving average along time.
+    """
+    Z = M['Z']
+    zmin, zmax, zlab = zr
+    zmask = (-Z >= zmin) & (-Z <= zmax)
+    zz = Z[zmask]
+    name = M['names'][p]
+    label = name.split('_', 1)[1].replace('_', ' ')
+
+    xt = mdates.date2num(M['time'])
+    fig, axes = plt.subplots(3, 1, figsize=(10, 8.5), sharex=True)
+    for ax, (rlabel, sk, gk) in zip(axes, HPROD_COLS):
+        F = _movavg(_hprod_field(M, grads, p, sk, gk), win)
+        _contour_panel(fig, ax, xt, zz, F[:, zmask].T, rlabel)
+    axes[-1].set_xlabel('time')
+    fig.suptitle(f'Mooring {name[0]} ({label}) — unfiltered — horizontal '
+                 f'production ({zlab}){avg_tag}', y=0.997)
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    fname = (f"{out_dir or M['fig_dir']}/"
+             f"mooring_{name}_hprod_hovmoller_{zlab}.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
+def _hovmoller_grid(M, zr, rlabels, fields_by_mooring, subset, figsize):
+    """Draw a rows x 2 depth-time contour grid, columns = moorings in `subset`.
+
+    `fields_by_mooring[p]` is the list of (time, depth) row fields for mooring p.
+    Color limits are shared per row across the two moorings (98th percentile over
+    both), so the columns are directly comparable; one colorbar per row.
+    """
+    Z = M['Z']
+    zmin, zmax, zlab = zr
+    zmask = (-Z >= zmin) & (-Z <= zmax)
+    zz = Z[zmask]
+    xt = mdates.date2num(M['time'])
+    nrows = len(rlabels)
+    # constrained_layout (not tight_layout) so the per-row colorbar that spans
+    # both columns lands at the far right instead of between them.
+    fig, axes = plt.subplots(nrows, 2, figsize=figsize, sharex=True, sharey=True,
+                             layout='constrained')
+    for r in range(nrows):
+        panels = [fields_by_mooring[p][r][:, zmask] for p in subset]  # (time, nz)
+        v = _autoscale(np.concatenate([P.ravel() for P in panels]))   # shared
+        for cix, P in enumerate(panels):
+            cs = _contourf(axes[r, cix], xt, zz, P.T, v)
+        axes[r, 0].set_ylabel(rlabels[r] + '\ndepth (m)', fontsize=9)
+        _add_colorbar(fig, cs, list(axes[r]), v)
+    for cix, p in enumerate(subset):
+        axes[0, cix].set_title(_moor_label(M['names'][p]), fontsize=11)
+        axes[-1, cix].set_xlabel('time')
+        for lbl in axes[-1, cix].get_xticklabels():   # rotate dates (no autofmt)
+            lbl.set_rotation(30)
+            lbl.set_horizontalalignment('right')
+    axes[0, 0].set_ylim(-zmax, -zmin)
+    return fig, zlab
+
+
+def make_profile_hovmoller_AC(M, comp, zr, subset=(0, 2), win=1, out_dir=None,
+                              avg_tag=''):
+    """A & C side-by-side (2-column) depth-time version of make_profile_fig.
+
+    Rows = the four profile quantities (see _profile_fields); columns = moorings
+    A and C. Color limits shared per row so the two columns are comparable.
+    `win` (samples) applies a centered moving average along time.
+    """
+    subset = list(subset)
+    fields = {p: _profile_fields(M, p, comp, win) for p in subset}
+    fig, zlab = _hovmoller_grid(M, zr, _profile_rlabels(comp), fields, subset,
+                                figsize=(13, 11))
+    fig.suptitle(f'Moorings A & C — unfiltered — {comp} profile '
+                 f'({zlab}){avg_tag}')
+    fname = (f"{out_dir or M['fig_dir']}/"
+             f"mooring_AC_{comp}_profile_hovmoller_{zlab}.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
+def make_hprod_hovmoller_AC(M, grads, zr, subset=(0, 2), win=1, out_dir=None,
+                            avg_tag=''):
+    """A & C side-by-side (2-column) depth-time version of make_hprod_fig.
+
+    Rows = the three horizontal-production terms (HPROD_COLS); columns = moorings
+    A and C. Color limits shared per row so the two columns are comparable.
+    `win` (samples) applies a centered moving average along time.
+    """
+    subset = list(subset)
+    fields = {p: [_movavg(_hprod_field(M, grads, p, sk, gk), win)
+                  for _, sk, gk in HPROD_COLS] for p in subset}
+    rlabels = [lab for lab, _, _ in HPROD_COLS]
+    fig, zlab = _hovmoller_grid(M, zr, rlabels, fields, subset, figsize=(13, 9))
+    fig.suptitle(f'Moorings A & C — unfiltered — horizontal production '
+                 f'({zlab}){avg_tag}')
+    fname = (f"{out_dir or M['fig_dir']}/"
+             f"mooring_AC_hprod_hovmoller_{zlab}.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
+def make_compare_all(loaded):
+    """Cross-model A&C profile comparison over the tpose24 window (both comps)."""
+    M = {}
+    for m in ('tpose24', 'tpose6'):
+        if m in loaded:
+            M[m] = loaded[m]
+        else:
+            cfg = MODELS[m]
+            path = (f"{importlib.import_module(cfg['io']).CACHE_DIR}/"
+                    f"{cfg['cache']}")
+            if not os.path.exists(path):
+                print(f'SKIP compare: {m} cache missing ({cfg["cache"]})')
+                return
+            M[m] = load_model(cfg)
+    for comp in ('U', 'V'):
+        print('wrote', make_profile_compare(M, comp))
+
+
 def main(models=None):
+    loaded = {}
     for model in (models or list(MODELS)):
         cfg = MODELS[model]
         if not os.path.exists(f"{importlib.import_module(cfg['io']).CACHE_DIR}/"
@@ -309,6 +643,7 @@ def main(models=None):
             continue
         os.makedirs(cfg['fig_dir'], exist_ok=True)
         M = load_model(cfg)
+        loaded[model] = M
         print(f'{model}: window {str(M["time"][0])[:10]} .. '
               f'{str(M["time"][-1])[:10]} ({M["time"].size} steps)')
         n = 0
@@ -327,7 +662,37 @@ def main(models=None):
         make_hprod_fig(M, grads)
         make_hprod_fig(M, grads, subset=[0, 2], tag='_AC')
         n += 2
+        # depth-time contour counterparts of the mean-profile figures, drawn raw
+        # and at three moving-average windows (subfolders). dt from the record.
+        prof_range = (PROFILE_ZMIN, PROFILE_ZMAX, '300-1500m')
+        dt_days = float(np.median(np.diff(M['time'])) / np.timedelta64(1, 'D'))
+
+        def hovmoller_set(win=1, out_dir=None, avg_tag=''):
+            k = 0
+            for p in range(len(M['names'])):
+                for comp in ('U', 'V'):
+                    make_profile_hovmoller(M, p, comp, prof_range, win, out_dir,
+                                           avg_tag)
+                    k += 1
+                make_hprod_hovmoller(M, grads, p, prof_range, win, out_dir, avg_tag)
+                k += 1
+            for comp in ('U', 'V'):                   # A & C side-by-side
+                make_profile_hovmoller_AC(M, comp, prof_range, win=win,
+                                          out_dir=out_dir, avg_tag=avg_tag)
+                k += 1
+            make_hprod_hovmoller_AC(M, grads, prof_range, win=win,
+                                    out_dir=out_dir, avg_tag=avg_tag)
+            return k + 1
+
+        n += hovmoller_set()                          # raw, top level
+        for days in (14, 25, 40):
+            win = max(1, round(days / dt_days))
+            od = f"{cfg['fig_dir']}/{days}day_mov_avg"
+            os.makedirs(od, exist_ok=True)
+            n += hovmoller_set(win, od, f' — {days}-day avg')
         print(f'{model}: wrote {n} figures to {cfg["fig_dir"]}')
+
+    make_compare_all(loaded)
 
 
 if __name__ == '__main__':
