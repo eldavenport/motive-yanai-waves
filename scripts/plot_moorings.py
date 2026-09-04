@@ -957,7 +957,7 @@ def main(models=None):
         n = 0
         for p in range(len(M['names'])):
             for comp in ('uw', 'vw'):
-                for treat in ('unfiltered', 'yanai'):
+                for treat in ('unfiltered',):     # no bandpass: moving-avg/total only
                     for zr in DEPTH_RANGES:
                         make_fig(M, p, comp, treat, zr)
                         n += 1
