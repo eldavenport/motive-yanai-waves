@@ -1,20 +1,24 @@
 """Deep-jet depth-time plots: zonal velocity split into low vs high vertical modes.
 
 For each of the three MOTIVE moorings (A 0.5N,140W; B 1.75N,138W; C 3N,140W) the
-total zonal velocity profile U(z,t) is decomposed into flat-bottom vertical normal
-modes cos(n*pi*z/H), n=0..20, fit over the full wet water column at each time (a
-cell-thickness-weighted least-squares Galerkin projection). The reconstruction is
-then split into "low" modes (n=1-10) and "high" modes (n=11-20); the barotropic
-n=0 (depth mean) is dropped from both. Equatorial deep jets are the stacked
-alternating-sign structure that lives in the high modes.
+total zonal velocity profile U(z,t) is decomposed into *dynamical* vertical normal
+modes -- the flat-bottom, rigid-lid baroclinic (pressure/horizontal-velocity) modes
+p_n(z) of the local buoyancy frequency N^2(z). The reconstruction is split into
+"low" modes (n=1-10) and "high" modes (n=11-20); the barotropic n=0 (depth mean)
+is dropped. Because the N^2-weighted modes stretch the thermocline, the EUC now
+projects onto the low modes (unlike flat cosines) and the deep jets onto the high.
 
-One figure per model: 2 rows x 3 columns (columns = moorings, top row = low modes,
-bottom row = high modes), y = depth (100-1000 m), x = time. Color scale is shared
-across the three moorings per row: +/-1 m/s (low), +/-0.3 m/s (high), cmo.balance.
+One figure per model (mooring_deep_jets_Umodes_*.png), modes from the TIME-MEAN
+N^2(z): 2 rows x 3 columns (columns = moorings, top = low modes, bottom = high),
+y = depth (100-1000 m), x = time. Color scale shared across the three moorings per
+row: +/-1 m/s (low), +/-0.3 m/s (high), cmo.balance, 100 filled-contour levels.
 
-ponytail: flat-bottom (constant-N^2) cosine modes, not true dynamical modes -- the
-mooring caches carry no THETA/SALT to build N^2(z). Fine for separating vertical
-scales; swap in Sturm-Liouville modes if a stratification profile is ever cached.
+Assumptions (flagged):
+  - N^2 from JMD95 in-situ density, parcels bracketed at the interface pressure to
+    remove compressibility; floored at 1e-7 s^-2 so modes stay real through the
+    mixed layer / weak inversions.
+  - Flat-bottom, rigid-lid modes over the full wet column to the true bottom H.
+Needs the stratification cache from build_strat_cache.py.
 """
 
 import os
@@ -22,17 +26,21 @@ import importlib
 import numpy as np
 import xarray as xr
 import cmocean
+import scipy.linalg
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 import plot_moorings as pm
+import eos_jmd95 as eos
 
-NMODES = 20                       # highest mode number in the fit
-LOW = slice(1, 11)                # modes 1-10
-HIGH = slice(11, 21)              # modes 11-20
+NMODES = 20                       # highest mode number kept
 ZMIN, ZMAX = 100.0, 1000.0        # plotted depth range (m, positive down)
+N_LEVELS = 100                    # filled-contour levels
+N2_FLOOR = 1e-7                   # s^-2, keeps the eigenproblem stably stratified
 CLIM = {'low': 1.0, 'high': 0.3}  # shared symmetric color limits (m/s)
+CTICK = {'low': 0.25, 'high': 0.1}   # colorbar tick step per band
 
 
 def _hfac_drf(cfg):
@@ -44,93 +52,101 @@ def _hfac_drf(cfg):
     return hfac, drF
 
 
-def mode_split(U, Z, drF, hfac):
-    """Low- and high-mode reconstructions of U(time, depth) for one mooring.
+def _load_strat(cfg, times):
+    """Window-aligned THETA, SALT (time, loc, depth) at the mooring columns."""
+    io = importlib.import_module(cfg['io'])
+    f = os.path.join(io.CACHE_DIR, cfg['cache'].replace('mooring', 'strat'))
+    if not os.path.exists(f):
+        return None
+    ds = xr.open_dataset(f).sel(time=times)
+    th, sa = ds['THETA'].values, ds['SALT'].values
+    ds.close()
+    return th, sa
 
-    U(z) is interpolated onto a uniform 5-m grid (where the cos(n*pi*z/H) modes
-    are orthogonal, so the projection is well conditioned -- a direct least-squares
-    fit on the native stretched grid blows up for n up to 20), projected onto
-    modes n=0..NMODES, then the modes 1-10 (low) and 11-20 (high) reconstructions
-    are mapped back onto the native depths. Returns (U_low, U_high) each
-    (time, depth) with below-bottom cells NaN; the barotropic n=0 is dropped.
+
+def n2_interfaces(theta, salt, zc):
+    """Buoyancy frequency N^2 at the interfaces between wet cell centers.
+
+    theta, salt: (nwet,) at centers; zc: center depth (m, positive down). Parcels
+    are compared at the common interface pressure (adiabatic N^2), floored positive.
     """
-    wet = hfac > 0
-    zc = -Z[wet]                                  # cell-center depth, positive down
-    H = float((drF * hfac)[wet].sum())             # water-column depth
-    zu = np.linspace(0.0, H, max(200, int(H / 5)))
-    Uw = U[:, wet]
+    di = 0.5 * (zc[:-1] + zc[1:])                      # interface depth (m)
+    p = eos.RHONIL * eos.GRAV * di / 1.0e4             # dbar
+    ru = eos.densjmd95(salt[:-1], theta[:-1], p)       # upper parcel at p
+    rl = eos.densjmd95(salt[1:], theta[1:], p)         # lower parcel at p
+    n2 = (eos.GRAV / eos.RHONIL) * (rl - ru) / (zc[1:] - zc[:-1])
+    return np.maximum(n2, N2_FLOOR)
 
-    Uu = np.array([np.interp(zu, zc, Uw[t]) for t in range(U.shape[0])])  # (time, nz)
-    n = np.arange(NMODES + 1)
-    Phi = np.cos(np.pi * np.outer(zu, n) / H)      # (nz, NMODES+1)
-    w = np.full(zu.size, zu[1] - zu[0]); w[0] = w[-1] = w[0] / 2   # trapezoid weights
-    cn = np.where(n == 0, 1.0, 2.0) / H
-    a = cn[None, :] * ((Uu * w) @ Phi)             # mode coeffs (time, NMODES+1)
 
+def pmodes(n2i, zc, dz):
+    """Flat-bottom baroclinic pressure modes from N^2 at interfaces.
+
+    Solves d/dz((1/N^2) dp/dz) = -(1/c^2) p with Neumann BC (no normal flow at
+    surface/bottom) as the symmetric generalized eigenproblem K p = (1/c^2) M p,
+    M = diag(cell thickness). Returns V (nwet, NMODES+1), M-orthonormal, ordered
+    by phase speed (mode 0 = barotropic), and M for the projection.
+    """
+    nz = len(zc)
+    a = 1.0 / (n2i * (zc[1:] - zc[:-1]))               # interface coupling (nz-1,)
+    K = np.zeros((nz, nz))
+    i = np.arange(nz - 1)
+    K[i, i] += a; K[i + 1, i + 1] += a
+    K[i, i + 1] -= a; K[i + 1, i] -= a
+    Mm = np.diag(dz)
+    _, V = scipy.linalg.eigh(K, Mm)                    # ascending 1/c^2  ->  V^T M V = I
+    return V[:, :NMODES + 1], Mm
+
+
+def _recon(U, V, Mm):
+    """Low- (modes 1-10) and high-mode (11-20) reconstructions of U (time, nwet)."""
+    a = V.T @ (Mm @ U.T)                               # coeffs (NMODES+1, time); V^T M V = I
+    return (V[:, 1:11] @ a[1:11]).T, (V[:, 11:21] @ a[11:21]).T
+
+
+def _place(low_w, high_w, shape, wet):
     out = []
-    for sl in (LOW, HIGH):
-        recu = a[:, sl] @ Phi[:, sl].T             # reconstruct on uniform grid
-        rec = np.full(U.shape, np.nan)
-        rec[:, wet] = np.array([np.interp(zc, zu, recu[t])
-                                for t in range(U.shape[0])])
+    for rw in (low_w, high_w):
+        rec = np.full(shape, np.nan)
+        rec[:, wet] = rw
         out.append(rec)
     return out
 
 
-def eof_split(U, Z, drF, hfac):
-    """Statistical-mode (EOF/PCA) analog of mode_split.
-
-    U(time, depth) over the wet column is decomposed by SVD into empirical
-    orthogonal functions, ranked by variance (cells weighted by sqrt of thickness
-    so coarse deep cells don't dominate the variance inner product). The field is
-    NOT time-centered, so EOF 1 carries the mean + dominant pattern -- keeping the
-    quasi-steady deep-jet structure, parallel to the dynamical-mode figure.
-    Low = EOFs 1-10, high = EOFs 11-20. Returns (U_low, U_high) each (time, depth),
-    below-bottom cells NaN.
-    """
+def split_mean(U, theta, salt, Z, drF, hfac):
+    """Low/high reconstructions using modes from the TIME-MEAN N^2 profile."""
     wet = hfac > 0
-    sw = np.sqrt((drF * hfac)[wet])                # sqrt cell thickness
-    Uc, S, Vt = np.linalg.svd(U[:, wet] * sw[None, :], full_matrices=False)
-
-    out = []
-    for a, b in ((0, 10), (10, 20)):
-        recw = (Uc[:, a:b] * S[a:b]) @ Vt[a:b]     # reconstruct weighted field
-        rec = np.full(U.shape, np.nan)
-        rec[:, wet] = recw / sw[None, :]
-        out.append(rec)
-    return out
+    zc, dz = -Z[wet], (drF * hfac)[wet]
+    n2 = n2_interfaces(np.nanmean(theta[:, wet], 0), np.nanmean(salt[:, wet], 0), zc)
+    V, Mm = pmodes(n2, zc, dz)
+    return _place(*_recon(U[:, wet], V, Mm), U.shape, wet)
 
 
-# decomposition variants: tag -> (splitter, basis label for the title)
-VARIANTS = {
-    'Umodes': (mode_split, 'vertical modes'),
-    'Ueof':   (eof_split,  'statistical modes (EOF)'),
-}
-
-
-def make_fig(M, cfg, split_fn, tag, basis_label):
+def make_fig(M, cfg, strat, splitter, tag, basis_label):
     hfac, drF = _hfac_drf(cfg)
-    Z, t, names = M['Z'], M['time'], M['names']
+    Z, names = M['Z'], M['names']
+    th, sa = strat
+    xt = mdates.date2num(M['time'])                    # contourf needs numeric x
     zmask = (-Z >= ZMIN) & (-Z <= ZMAX)
     zz = Z[zmask]
 
-    # (band, mooring) -> (time, depth) reconstruction
-    rec = {}
+    rec = {}                                           # (band, mooring) -> (time, depth)
     for p in range(len(names)):
         Utot = M['mean']['U'][p][None, :] + M['treat']['unfiltered']['u'][:, p, :]
-        low, high = split_fn(Utot, Z, drF, hfac[p])
+        low, high = splitter(Utot, th[:, p, :], sa[:, p, :], Z, drF, hfac[p])
         rec['low', p], rec['high', p] = low, high
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 7.5), sharex=True, sharey=True,
                              layout='constrained')
-    rows = [('low', '1-10'), ('high', '11-20')]
-    for ri, (band, modes) in enumerate(rows):
+    for ri, (band, modes) in enumerate([('low', '1-10'), ('high', '11-20')]):
         v = CLIM[band]
+        levels = np.linspace(-v, v, N_LEVELS + 1)
         for p in range(len(names)):
-            pc = axes[ri, p].pcolormesh(t, zz, rec[band, p][:, zmask].T,
-                                        cmap=cmocean.cm.balance, vmin=-v, vmax=v,
-                                        shading='nearest')
-        cb = fig.colorbar(pc, ax=list(axes[ri]), pad=0.01, shrink=0.9)
+            cs = axes[ri, p].contourf(xt, zz, rec[band, p][:, zmask].T,
+                                      levels=levels, cmap=cmocean.cm.balance,
+                                      extend='both')
+            axes[ri, p].xaxis_date()
+        cb = fig.colorbar(cs, ax=list(axes[ri]), pad=0.01, shrink=0.9,
+                          ticks=np.arange(-v, v + CTICK[band] / 2, CTICK[band]))
         cb.set_label('m s$^{-1}$')
         axes[ri, 0].set_ylabel(f'{band} modes ({modes})\ndepth (m)', fontsize=10)
     for p in range(len(names)):
@@ -148,19 +164,47 @@ def make_fig(M, cfg, split_fn, tag, basis_label):
     return fname
 
 
+VARIANTS = [('Umodes', split_mean, 'vertical modes (mean N²)')]
+
+
 def main(models=None):
     for model in (models or list(pm.MODELS)):
         cfg = pm.MODELS[model]
-        path = (f"{importlib.import_module(cfg['io']).CACHE_DIR}/{cfg['cache']}")
+        path = f"{importlib.import_module(cfg['io']).CACHE_DIR}/{cfg['cache']}"
         if not os.path.exists(path):
-            print(f'SKIP {model}: cache not found ({cfg["cache"]})')
+            print(f'SKIP {model}: mooring cache not found ({cfg["cache"]})')
             continue
         os.makedirs(cfg['fig_dir'], exist_ok=True)
         M = pm.load_model(cfg)
-        for tag, (split_fn, basis_label) in VARIANTS.items():
-            print('wrote', make_fig(M, cfg, split_fn, tag, basis_label))
+        strat = _load_strat(cfg, M['time'])
+        if strat is None:
+            print(f'SKIP {model}: strat cache missing (run build_strat_cache.py)')
+            continue
+        for tag, splitter, label in VARIANTS:
+            print('wrote', make_fig(M, cfg, strat, splitter, tag, label))
+
+
+def _selfcheck():
+    """pmodes on constant N^2 must give c_n = N H/(n pi) and cosine structure."""
+    N, H, nz = 3e-3, 1000.0, 200
+    dz = np.full(nz, H / nz)
+    zc = np.cumsum(dz) - dz / 2
+    n2i = np.full(nz - 1, N ** 2)
+    V, Mm = pmodes(n2i, zc, dz)
+    a = 1.0 / (n2i * (zc[1:] - zc[:-1]))
+    K = np.zeros((nz, nz)); i = np.arange(nz - 1)
+    K[i, i] += a; K[i + 1, i + 1] += a; K[i, i + 1] -= a; K[i + 1, i] -= a
+    for n in range(1, 6):
+        p = V[:, n]
+        c = 1 / np.sqrt((p @ K @ p) / (p @ Mm @ p))
+        assert abs(c - N * H / (n * np.pi)) < 1e-3, (n, c)
+        assert abs(np.corrcoef(p, np.cos(n * np.pi * zc / H))[0, 1]) > 0.999
+    print('pmodes self-check OK')
 
 
 if __name__ == '__main__':
     import sys
-    main(sys.argv[1:] or None)
+    if sys.argv[1:2] == ['test']:
+        _selfcheck()
+    else:
+        main(sys.argv[1:] or None)
