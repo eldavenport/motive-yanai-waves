@@ -158,7 +158,73 @@ def make_fig(M, cfg, strat, splitter, tag, basis_label):
     axes[0, 0].set_ylim(-ZMAX, -ZMIN)
     fig.suptitle(f'Equatorial deep jets — zonal velocity {basis_label} '
                  f'({ZMIN:.0f}-{ZMAX:.0f} m)')
-    fname = f"{M['fig_dir']}/mooring_deep_jets_{tag}_{ZMIN:.0f}-{ZMAX:.0f}m.png"
+    fname = pm.fig_path(M['fig_dir'],
+                        f"mooring_deep_jets_{tag}_{ZMIN:.0f}-{ZMAX:.0f}m.png")
+    fig.savefig(fname, dpi=140)
+    plt.close(fig)
+    return fname
+
+
+OVERLAY_DAYS = 3        # light moving-avg window (days) for the overlaid u'w';
+                        # keeps flux-event structure (heavy averaging smears it)
+N_UW_LINES = 5          # +/- contour lines of u'w' overlaid (zero omitted)
+
+
+def make_overlay_fig(M, cfg, strat, treat='yanai'):
+    """High-mode zonal velocity with the u'w' flux overlaid as contour lines.
+
+    Same bottom-row high-mode (11-20) reconstruction as make_fig, one column per
+    mooring (filled contour, cmo.balance, +/-CLIM['high']); on top, contour LINES
+    of u'w' = <u' w'> smoothed with an OVERLAY_DAYS moving average (solid =
+    positive/eastward flux, dashed = negative). `treat` picks the perturbation
+    band for u'w' ('yanai' 15-40 day vs 'unfiltered' total anomaly). Lets you
+    read whether the momentum flux tracks the deep-jet shear bands.
+    """
+    hfac, drF = _hfac_drf(cfg)
+    Z, names = M['Z'], M['names']
+    th, sa = strat
+    xt = mdates.date2num(M['time'])
+    zmask = (-Z >= ZMIN) & (-Z <= ZMAX)
+    zz = Z[zmask]
+
+    dt_days = float(np.median(np.diff(M['time'])) / np.timedelta64(1, 'D'))
+    win = max(1, round(OVERLAY_DAYS / dt_days))
+    high, uw = {}, {}
+    for p in range(len(names)):
+        Utot = M['mean']['U'][p][None, :] + M['treat']['unfiltered']['u'][:, p, :]
+        _, high[p] = split_mean(Utot, th[:, p, :], sa[:, p, :], Z, drF, hfac[p])
+        up, wp = M['treat'][treat]['u'][:, p, :], M['treat'][treat]['w'][:, p, :]
+        uw[p] = pm._movavg(up * wp, win)
+
+    v = CLIM['high']
+    levels = np.linspace(-v, v, N_LEVELS + 1)
+    vuw = pm._autoscale(np.concatenate([uw[p][:, zmask].ravel() for p in uw]))
+    uw_levels = np.linspace(-vuw, vuw, 2 * N_UW_LINES + 1)
+    uw_levels = uw_levels[uw_levels != 0.0]            # drop the zero contour
+
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.2), sharex=True, sharey=True,
+                             layout='constrained')
+    for p in range(len(names)):
+        cs = axes[p].contourf(xt, zz, high[p][:, zmask].T, levels=levels,
+                              cmap=cmocean.cm.balance, extend='both')
+        axes[p].contour(xt, zz, uw[p][:, zmask].T, levels=uw_levels,
+                        colors='k', linewidths=0.7)
+        axes[p].xaxis_date()
+        axes[p].set_title(pm._moor_label(names[p]), fontsize=11)
+        axes[p].set_xlabel('time')
+        for lbl in axes[p].get_xticklabels():
+            lbl.set_rotation(30); lbl.set_horizontalalignment('right')
+    cb = fig.colorbar(cs, ax=list(axes), pad=0.01, shrink=0.9,
+                      ticks=np.arange(-v, v + CTICK['high'] / 2, CTICK['high']))
+    cb.set_label('high-mode U (m s$^{-1}$)')
+    axes[0].set_ylabel('depth (m)')
+    axes[0].set_ylim(-ZMAX, -ZMIN)
+    band = '15-40 day' if treat == 'yanai' else 'total (unfiltered)'
+    fig.suptitle(f"Deep jets (high modes 11-20) with {band} $u'w'$ overlaid "
+                 f"(solid +, dashed −; {OVERLAY_DAYS}-day avg; {ZMIN:.0f}-{ZMAX:.0f} m)")
+    fname = pm.fig_path(M['fig_dir'],
+                        f"mooring_deep_jets_highmode_uw_overlay_{treat}_"
+                        f"{ZMIN:.0f}-{ZMAX:.0f}m.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -182,6 +248,8 @@ def main(models=None):
             continue
         for tag, splitter, label in VARIANTS:
             print('wrote', make_fig(M, cfg, strat, splitter, tag, label))
+        for treat in ('yanai', 'unfiltered'):      # band-passed + total u'w' overlay
+            print('wrote', make_overlay_fig(M, cfg, strat, treat))
 
 
 def _selfcheck():

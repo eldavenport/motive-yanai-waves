@@ -22,6 +22,7 @@ Figures -> figures/ (TPOSE24) and figures/tpose6/ (TPOSE6).
 """
 
 import os
+import re
 import importlib
 import numpy as np
 import pandas as pd
@@ -41,6 +42,59 @@ import shear as sh
 import stats_corr as sc
 
 REPO = '/home/edavenport/analysis/motive-yanai-waves'
+
+# ---- figure organization: route each figure into a science-theme subfolder ----
+# Theme is a deterministic function of the filename, applied inside each model's
+# fig_dir. The matching here is the single source of truth; reorg_figures.py was a
+# one-shot mover that reused these same rules.
+_THEME_PREFIX = {
+    'a1_': 'flux_timeseries', 'a2_': 'flux_timeseries', 'b_': 'flux_profiles',
+    'c1_': 'flux_maps', 'c2_': 'flux_maps', 'c3_': 'flux_maps', 'c4_': 'flux_maps',
+    'd1_': 'shear_divergence', 'd2_': 'shear_divergence', 'd3_': 'shear_divergence',
+    'd4_': 'shear_divergence', 'e1_': 'magnitude_sections',
+    'e2_': 'magnitude_sections', 'e3_': 'magnitude_sections', 'diag_': 'diagnostics',
+}
+_MOVAVG_RE = re.compile(r'\d+day_mov_avg$')
+
+
+def _theme_for(name):
+    """Science-theme subfolder for a figure basename ('' = keep at top level)."""
+    if name.startswith('mooring_deep_jets_'):
+        return 'deep_jets'
+    if '_spectrum_' in name:
+        return 'spectra'
+    if '_uw_' in name or '_vw_' in name:
+        return 'momentum_stress'
+    if ('_profile_hovmoller' in name or '_hprod_hovmoller' in name
+            or name.startswith(('mooring_profiles_', 'mooring_hprod_',
+                                 'mooring_prod_'))):
+        return 'shear_production'
+    if name.startswith('uv_merid_'):
+        return 'momentum_budget'
+    for pre, sub in _THEME_PREFIX.items():
+        if name.startswith(pre):
+            return sub
+    return ''
+
+
+def fig_path(out_dir, name):
+    """Route figure `name` into its theme subfolder under `out_dir`.
+
+    If `out_dir` ends in an `<N>day_mov_avg` component the theme folder is
+    inserted *above* it (e.g. figures/shear_production/14day_mov_avg/...), so the
+    moving-average grouping is preserved. Directory made on demand; `name`
+    includes the extension.
+    """
+    out_dir = out_dir.rstrip('/')
+    base = os.path.basename(out_dir)
+    if _MOVAVG_RE.match(base):
+        parent, avg = os.path.dirname(out_dir), base
+    else:
+        parent, avg = out_dir, ''
+    d = os.path.join(parent, _theme_for(name), avg)
+    os.makedirs(d, exist_ok=True)
+    return os.path.join(d, name)
+
 
 MODELS = {
     'tpose24': dict(io='tpose24_io', cache='yanai_mooring_dt60.nc',
@@ -75,6 +129,9 @@ PROFILE_ZMAX = 1500.0
 
 # per-mooring line colors for the overlaid profile figures (A, B, C)
 MOORING_COLORS = ['black', 'blue', 'red']
+
+# treatment label for titles (perturbation = total anomaly vs 15-40 day band)
+TREAT_LBL = {'unfiltered': 'total (unfiltered)', 'yanai': '15-40 day band'}
 
 # figure layouts: label + which field key each row shows
 FIGS = {
@@ -127,20 +184,21 @@ def _moor_label(name):
     return f"{name[0]} ({name.split('_', 1)[1].replace('_', ' ')})"
 
 
-def make_profile_fig(M, comp, subset=None, tag=''):
+def make_profile_fig(M, comp, subset=None, tag='', treat='unfiltered'):
     """Three-column mean-profile figure for velocity component `comp` ('U'/'V').
 
     col1: time-mean velocity <comp>; col2: mean shear d<comp>/dz (dotted, top
     axis) and the vertical Reynolds stress -<comp'w'> (solid, bottom axis);
     col3: the shear production -<comp'w'> d<comp>/dz. The moorings in `subset`
     (indices into M['names']; default all) are overlaid in their fixed colors.
-    Unfiltered (total) perturbations only.
+    `treat` selects the eddy perturbation band ('unfiltered' total vs 'yanai'
+    15-40 day); the background mean/shear is the same either way.
     """
     vk = comp.lower()                                 # 'u' or 'v'
     Z = M['Z']
     zmask = (-Z >= PROFILE_ZMIN) & (-Z <= PROFILE_ZMAX)
     zz = Z[zmask]
-    d = M['treat']['unfiltered']
+    d = M['treat'][treat]
     subset = range(len(M['names'])) if subset is None else subset
 
     fig, (ax0, ax1, ax2) = plt.subplots(1, 3, figsize=(12, 6.5), sharey=True)
@@ -174,10 +232,10 @@ def make_profile_fig(M, comp, subset=None, tag=''):
     ax2.set_xlabel('production (m$^2$ s$^{-3}$)')
     ax2.ticklabel_format(axis='x', style='sci', scilimits=(-2, 2))
     ax0.set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
-    fig.suptitle(f'Mooring mean profiles — {comp} — unfiltered '
+    fig.suptitle(f'Mooring mean profiles — {comp} — {TREAT_LBL[treat]} '
                  f'({PROFILE_ZMIN:.0f}-{PROFILE_ZMAX:.0f} m)', y=0.99)
     fig.tight_layout()
-    fname = f"{M['fig_dir']}/mooring_profiles_{comp}_unfiltered{tag}.png"
+    fname = fig_path(M['fig_dir'], f"mooring_profiles_{comp}_{treat}{tag}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -264,7 +322,8 @@ def make_profile_compare(M, comp, subset=(0, 2)):
     ax0.legend(model_h, model_l, fontsize=8, loc='lower right', title='model')
     ax0.set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
     fig.tight_layout()
-    fname = f'{REPO}/figures/mooring_profiles_{comp}_compare_t24window.png'
+    fname = fig_path(f'{REPO}/figures',
+                     f'mooring_profiles_{comp}_compare_t24window.png')
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -301,17 +360,18 @@ def load_mean_gradients(cfg, mlon, mlat):
     return Zmv, grads
 
 
-def make_hprod_fig(M, grads, subset=None, tag=''):
-    """Horizontal shear-production profiles at the moorings (unfiltered).
+def make_hprod_fig(M, grads, subset=None, tag='', treat='unfiltered'):
+    """Horizontal (barotropic) shear-production profiles at the moorings.
 
     Three columns: -<v'v'> d<V>/dy, -<u'v'> d<U>/dy, -<u'v'> d<V>/dx. Horizontal
-    Reynolds stresses come from the mooring perturbations; the mean-flow
-    gradients come from the mean-U/V map cache (see load_mean_gradients).
+    Reynolds stresses come from the mooring perturbations (`treat`: 'unfiltered'
+    total vs 'yanai' 15-40 day band); the mean-flow gradients come from the
+    mean-U/V map cache (see load_mean_gradients) and are the same either way.
     """
     Z = M['Z']
     zmask = (-Z >= PROFILE_ZMIN) & (-Z <= PROFILE_ZMAX)
     zz = Z[zmask]
-    d = M['treat']['unfiltered']
+    d = M['treat'][treat]
     subset = range(len(M['names'])) if subset is None else subset
 
     cols = [(r"$-\langle v'v'\rangle\,\partial_y\langle V\rangle$", 'vv', 'dVdy'),
@@ -336,10 +396,10 @@ def make_hprod_fig(M, grads, subset=None, tag=''):
     axes[0].set_ylabel('depth (m)')
     axes[0].legend(fontsize=8, loc='lower left')
     axes[0].set_ylim(-PROFILE_ZMAX, -PROFILE_ZMIN)
-    fig.suptitle(f'Mooring horizontal shear production — unfiltered '
+    fig.suptitle(f'Mooring horizontal shear production — {TREAT_LBL[treat]} '
                  f'({PROFILE_ZMIN:.0f}-{PROFILE_ZMAX:.0f} m)', y=0.99)
     fig.tight_layout()
-    fname = f"{M['fig_dir']}/mooring_hprod_unfiltered{tag}.png"
+    fname = fig_path(M['fig_dir'], f"mooring_hprod_{treat}{tag}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -428,7 +488,7 @@ def make_fig(M, p, comp, treat, zr):
                  f'({zlab})', y=0.997)
     fig.autofmt_xdate()
     fig.tight_layout()
-    fname = f"{M['fig_dir']}/mooring_{name}_{comp}_{treat}_{zlab}.png"
+    fname = fig_path(M['fig_dir'], f"mooring_{name}_{comp}_{treat}_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -506,8 +566,8 @@ def make_profile_hovmoller(M, p, comp, zr, win=1, out_dir=None, avg_tag=''):
                  f'profile ({zlab}){avg_tag}', y=0.997)
     fig.autofmt_xdate()
     fig.tight_layout()
-    fname = (f"{out_dir or M['fig_dir']}/"
-             f"mooring_{name}_{comp}_profile_hovmoller_{zlab}.png")
+    fname = fig_path(out_dir or M['fig_dir'],
+                     f"mooring_{name}_{comp}_profile_hovmoller_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -538,8 +598,8 @@ def make_hprod_hovmoller(M, grads, p, zr, win=1, out_dir=None, avg_tag=''):
                  f'production ({zlab}){avg_tag}', y=0.997)
     fig.autofmt_xdate()
     fig.tight_layout()
-    fname = (f"{out_dir or M['fig_dir']}/"
-             f"mooring_{name}_hprod_hovmoller_{zlab}.png")
+    fname = fig_path(out_dir or M['fig_dir'],
+                     f"mooring_{name}_hprod_hovmoller_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -593,8 +653,8 @@ def make_profile_hovmoller_AC(M, comp, zr, subset=(0, 2), win=1, out_dir=None,
                                 figsize=(13, 11))
     fig.suptitle(f'Moorings A & C — unfiltered — {comp} profile '
                  f'({zlab}){avg_tag}')
-    fname = (f"{out_dir or M['fig_dir']}/"
-             f"mooring_AC_{comp}_profile_hovmoller_{zlab}.png")
+    fname = fig_path(out_dir or M['fig_dir'],
+                     f"mooring_AC_{comp}_profile_hovmoller_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -615,8 +675,8 @@ def make_hprod_hovmoller_AC(M, grads, zr, subset=(0, 2), win=1, out_dir=None,
     fig, zlab = _hovmoller_grid(M, zr, rlabels, fields, subset, figsize=(13, 9))
     fig.suptitle(f'Moorings A & C — unfiltered — horizontal production '
                  f'({zlab}){avg_tag}')
-    fname = (f"{out_dir or M['fig_dir']}/"
-             f"mooring_AC_hprod_hovmoller_{zlab}.png")
+    fname = fig_path(out_dir or M['fig_dir'],
+                     f"mooring_AC_hprod_hovmoller_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -753,7 +813,7 @@ def make_prod_diff_AC(loaded=None):
                  '(±1 SEM, N_eff) over '
                  f'{str(t0)[:10]} .. {str(t1)[:10]}', y=0.99)
     fig.tight_layout()
-    fname = f'{out_dir}/mooring_prod_diff_AC.png'
+    fname = fig_path(out_dir, 'mooring_prod_diff_AC.png')
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     print('wrote', fname)
@@ -824,7 +884,7 @@ def make_prod_compare_AC(loaded=None):
                  '(shaded ±1 SEM, N_eff) over '
                  f'{str(t0)[:10]} .. {str(t1)[:10]}', y=0.99)
     fig.tight_layout()
-    fname = f'{out_dir}/mooring_prod_compare_AC.png'
+    fname = fig_path(out_dir, 'mooring_prod_compare_AC.png')
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     print('wrote', fname)
@@ -892,8 +952,8 @@ def make_profile_hovmoller_compare(Mr, t0, t1, comp, zr, win=1, out_dir=None,
     axes[0, 0].set_ylim(-zmax, -zmin)
     fig.suptitle(f'Moorings A & C — Vel vs noVel — {comp} profile ({zlab})'
                  f'{avg_tag}  [{str(t0)[:10]} .. {str(t1)[:10]}]')
-    fname = (f"{out_dir or REPO + '/figures/tpose6_compare'}/"
-             f"mooring_AC_compare_{comp}_profile_hovmoller_{zlab}.png")
+    fname = fig_path(out_dir or REPO + '/figures/tpose6_compare',
+                     f"mooring_AC_compare_{comp}_profile_hovmoller_{zlab}.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     print('wrote', fname)
@@ -963,15 +1023,18 @@ def main(models=None):
                         n += 1
         if not cfg.get('contours_only'):
             for comp in ('U', 'V'):                   # mean-profile line figures
-                make_profile_fig(M, comp)              # all moorings
-                make_profile_fig(M, comp, subset=[0, 2], tag='_AC')  # A & C only
-                n += 2
+                for treat in ('unfiltered', 'yanai'):  # total + 15-40 day band
+                    make_profile_fig(M, comp, treat=treat)             # all moorings
+                    make_profile_fig(M, comp, subset=[0, 2], tag='_AC',
+                                     treat=treat)                      # A & C only
+                    n += 2
         # horizontal shear-production profiles (needs mean-U/V map cache)
         _, grads = load_mean_gradients(cfg, M['lon'], M['lat'])
         if not cfg.get('contours_only'):
-            make_hprod_fig(M, grads)
-            make_hprod_fig(M, grads, subset=[0, 2], tag='_AC')
-            n += 2
+            for treat in ('unfiltered', 'yanai'):
+                make_hprod_fig(M, grads, treat=treat)
+                make_hprod_fig(M, grads, subset=[0, 2], tag='_AC', treat=treat)
+                n += 2
         # depth-time contour counterparts of the mean-profile figures, drawn raw
         # and at three moving-average windows (subfolders). dt from the record.
         prof_range = (PROFILE_ZMIN, PROFILE_ZMAX, '300-1500m')
