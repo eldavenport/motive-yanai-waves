@@ -29,15 +29,17 @@ import matplotlib.pyplot as plt
 
 import plot_moorings as pm
 
-# cov3d cache per model (component-stacked time-mean covariances)
-COV3D = {'tpose24': 'yanai_flux_cov3d_dt60.nc', 'tpose6': 'yanai_flux_cov3d_tp6.nc'}
+# band-passed <u'v'> source per model: tpose24 uses the cheap single-column
+# section (build_uv_section) that stands in for the full-domain cov3d 'uv'
+# component; tpose6 uses its full cov3d cache (build_map_cache_t6).
+COV3D = {'tpose24': 'yanai_uv_section_band_dt60.nc', 'tpose6': 'yanai_flux_cov3d_tp6.nc'}
 # longitudes to section (deg W); only those inside the model domain are drawn
 LONS_W = {'tpose24': [140], 'tpose6': [170, 140, 110]}
 LAT_LIM = 5.0            # +/- latitude shown (deg)
 # depth windows (zmin, zmax, filename tag). The colour limit auto-scales to the
 # plotted band, so the 100-1000 m view gets smaller limits that bring out the
 # (much weaker) deep structure hidden under the surface-intensified signal.
-ZRANGES = [(0.0, 1500.0, ''), (100.0, 1000.0, '_100-1000m')]
+ZRANGES = [(0.0, 1500.0, ''), (200.0, 1000.0, '_200-1000m')]
 R_EARTH, D2R = 6371e3, np.pi / 180.0
 
 
@@ -81,12 +83,12 @@ def make_fig(cfg, lon_w, lat, depth, uv, zmin, zmax, ztag, treat):
     for ax, (title, F) in zip(axes, panels):
         Fs = F[np.ix_(zmask, lmask)]
         v = pm._autoscale(Fs)
-        pcm = ax.pcolormesh(yy, zz, Fs, cmap='RdBu_r', vmin=-v, vmax=v,
-                            shading='auto')
+        cs = ax.contourf(yy, zz, Fs, levels=np.linspace(-v, v, pm.N_LEVELS + 1),
+                         cmap='RdBu_r', extend='both')
         ax.axvline(0, color='0.3', lw=0.8)
         ax.set_xlabel('latitude (deg)')
         ax.set_title(title, fontsize=10)
-        fig.colorbar(pcm, ax=ax, pad=0.01, shrink=0.9)
+        pm._add_colorbar(fig, cs, ax, v)
     axes[0].set_ylabel('depth (m)')
     axes[0].set_ylim(-zmax, -zmin)
     fig.suptitle(f'Meridional eddy flux of zonal momentum — {lon_w}W '

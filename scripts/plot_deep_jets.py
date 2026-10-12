@@ -36,7 +36,7 @@ import plot_moorings as pm
 import eos_jmd95 as eos
 
 NMODES = 20                       # highest mode number kept
-ZMIN, ZMAX = 100.0, 1000.0        # plotted depth range (m, positive down)
+ZMIN, ZMAX = 200.0, 1000.0        # plotted depth range (m, positive down)
 N_LEVELS = 100                    # filled-contour levels
 N2_FLOOR = 1e-7                   # s^-2, keeps the eigenproblem stably stratified
 CLIM = {'low': 1.0, 'high': 0.3}  # shared symmetric color limits (m/s)
@@ -170,7 +170,7 @@ OVERLAY_DAYS = 3        # light moving-avg window (days) for the overlaid u'w';
 N_UW_LINES = 5          # +/- contour lines of u'w' overlaid (zero omitted)
 
 
-def make_overlay_fig(M, cfg, strat, treat='yanai'):
+def make_overlay_fig(M, cfg, strat, treat='yanai', overlay_days=OVERLAY_DAYS):
     """High-mode zonal velocity with the u'w' flux overlaid as contour lines.
 
     Same bottom-row high-mode (11-20) reconstruction as make_fig, one column per
@@ -188,7 +188,7 @@ def make_overlay_fig(M, cfg, strat, treat='yanai'):
     zz = Z[zmask]
 
     dt_days = float(np.median(np.diff(M['time'])) / np.timedelta64(1, 'D'))
-    win = max(1, round(OVERLAY_DAYS / dt_days))
+    win = max(1, round(overlay_days / dt_days))
     high, uw = {}, {}
     for p in range(len(names)):
         Utot = M['mean']['U'][p][None, :] + M['treat']['unfiltered']['u'][:, p, :]
@@ -221,10 +221,10 @@ def make_overlay_fig(M, cfg, strat, treat='yanai'):
     axes[0].set_ylim(-ZMAX, -ZMIN)
     band = '15-40 day' if treat == 'yanai' else 'total (unfiltered)'
     fig.suptitle(f"Deep jets (high modes 11-20) with {band} $u'w'$ overlaid "
-                 f"(solid +, dashed −; {OVERLAY_DAYS}-day avg; {ZMIN:.0f}-{ZMAX:.0f} m)")
+                 f"(solid +, dashed −; {overlay_days}-day avg; {ZMIN:.0f}-{ZMAX:.0f} m)")
     fname = pm.fig_path(M['fig_dir'],
                         f"mooring_deep_jets_highmode_uw_overlay_{treat}_"
-                        f"{ZMIN:.0f}-{ZMAX:.0f}m.png")
+                        f"{overlay_days}dayavg_{ZMIN:.0f}-{ZMAX:.0f}m.png")
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     return fname
@@ -249,7 +249,8 @@ def main(models=None):
         for tag, splitter, label in VARIANTS:
             print('wrote', make_fig(M, cfg, strat, splitter, tag, label))
         for treat in ('yanai', 'unfiltered'):      # band-passed + total u'w' overlay
-            print('wrote', make_overlay_fig(M, cfg, strat, treat))
+            for days in (1, 3):                     # smoothing window for overlaid u'w'
+                print('wrote', make_overlay_fig(M, cfg, strat, treat, days))
 
 
 def _selfcheck():

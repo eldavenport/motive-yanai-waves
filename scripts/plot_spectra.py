@@ -10,7 +10,7 @@ log-spaced contour lines help read the levels; the 15-40 day Yanai band is marke
 One figure per mooring (mooring_<name>_spectrum_depth_freq.png -> spectra/).
 Reuses the mooring cache + perturbation construction from plot_moorings.
 
-Record-length caveat: tpose24 is ~3 months and tpose6 ~10 months, so the
+Record-length caveat: tpose24 is ~6 months and tpose6 ~10 months, so the
 low-frequency (near-annual) end is coarse/under-resolved -- these resolve the
 intraseasonal / Yanai band well, not the annual cycle. The noVel 5-year run is
 the one to use for a true cycles-per-year spectrum (not drawn here by request).
@@ -31,7 +31,7 @@ import wave_filter as wf
 ZMIN, ZMAX = 0.0, 1500.0      # plotted depth range (m, positive down)
 XMAX_CPY = 60.0               # frequency axis limit (cycles per year)
 N_CONTOURS = 6                # log-spaced PSD contour lines overlaid
-N_FILL = 20                   # log-spaced filled-contour levels
+N_FILL = 100                  # log-spaced filled-contour levels (near-continuous)
 N_DECADES = 4.0               # color range spans this many decades below the max
 DAYS_PER_YEAR = 365.25
 

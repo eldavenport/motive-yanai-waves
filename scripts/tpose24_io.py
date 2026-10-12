@@ -1,14 +1,22 @@
-"""IO helpers for the TPOSE24 dt=60 run (oct2012_3mo_dt60_AB3).
+"""IO helpers for the TPOSE24 dt=60 run (6-month Oct 2012 - Apr 2013).
 
-The MITgcm diag_state output is raw big-endian float32 with the field order
+The full 6-month record is two back-to-back MITgcm segments sharing one ref
+date and iteration clock (2012-10-01, dt=60 s, 3-hourly diag output):
+    oct2012_dt60_10072026   parent, iters 180..132480   (days 0.125..92)
+    jan2013_from_pickup     extension, iters 129780..262080 (days 90..182)
+The extension restarted from the parent's day-90 pickup and is bit-identical in
+the ~2-day overlap, so iteration numbers are globally meaningful and the two
+segments concatenate into one continuous record. See `SEGMENTS` / `_iter_dir`.
+
+The diag_state output is raw big-endian float32 with the field order
     THETA, SALT, UVEL, VVEL, WVEL, PHIHYD, DRHODR
 packed as (nz, ny, nx) per field per iteration file. Grid files (XC, YC, RC,
-DRF, hFacC, ...) live in the same run directory and are shared across all
-TPOSE24 runs.
+DRF, hFacC, ...) live in each segment directory (identical across both).
 
 Field reads use direct big-endian memmap offsets (fast, low memory); grid
 coordinates are taken from a light 2-iteration xmitgcm load so the spherical
-grid is not reconstructed by hand.
+grid is not reconstructed by hand. Every read goes through `_path(it)`, which
+routes an iteration to its owning segment, so callers are segment-agnostic.
 """
 
 import os
@@ -18,8 +26,12 @@ import numpy as np
 import pandas as pd
 
 # --- run configuration --------------------------------------------------------
-RUN_DIR   = '/data/SO3/edavenport/tpose24/oct2012_3mo_dt60_AB3'
-GRID_DIR  = RUN_DIR                       # grid files shared, live in the run dir
+# 6-month record as ordered segments; the overlap resolves to the FIRST segment
+# that owns an iteration (parent wins), so the record is continuous and dedup'd.
+SEGMENTS = ['/data/SO3/edavenport/tpose24/oct2012_dt60_10072026',  # parent 0-92d
+            '/data/SO3/edavenport/tpose24/jan2013_from_pickup']    # extension 90-182d
+RUN_DIR   = ' + '.join(os.path.basename(s) for s in SEGMENTS)  # provenance label
+GRID_DIR  = SEGMENTS[0]                    # grid files identical across segments
 CACHE_DIR = '/data/SO3/edavenport/tpose24/cache'
 REF_DATE  = '2012-10-01'
 DELTA_T   = 60.0                          # model time step (s), dt=60 run
@@ -39,12 +51,25 @@ FIELD_IDX = {'THETA': 0, 'SALT': 1, 'UVEL': 2, 'VVEL': 3,
 _SLICE = NY * NX                         # elements in one horizontal level
 _FIELD = NZ * _SLICE                     # elements in one full 3D field
 
+_ITER_DIR = None                         # lazy iter -> segment dir map (dedup'd)
+
+
+def _iter_dir():
+    """Map {iteration -> owning segment dir}, first segment wins on overlap."""
+    global _ITER_DIR
+    if _ITER_DIR is None:
+        m = {}
+        for seg in SEGMENTS:
+            for f in glob.glob(os.path.join(seg, 'diag_state.*.data')):
+                it = int(re.search(r'\.(\d+)\.data$', f).group(1))
+                m.setdefault(it, seg)       # setdefault -> earlier segment wins
+        _ITER_DIR = m
+    return _ITER_DIR
+
 
 def diag_iters():
-    """Sorted iteration numbers with a diag_state file present."""
-    its = [int(re.search(r'\.(\d+)\.data$', f).group(1))
-           for f in glob.glob(os.path.join(RUN_DIR, 'diag_state.*.data'))]
-    return np.array(sorted(its))
+    """Sorted iteration numbers present across the concatenated segments."""
+    return np.array(sorted(_iter_dir()))
 
 
 def iter_times(iters):
@@ -78,7 +103,7 @@ def edge_trim_mask(times, trim_days=EDGE_TRIM_DAYS):
 
 
 def _path(it):
-    return os.path.join(RUN_DIR, f'diag_state.{it:010d}.data')
+    return os.path.join(_iter_dir()[int(it)], f'diag_state.{it:010d}.data')
 
 
 def read_column(it, field, i, j):
@@ -149,7 +174,7 @@ def load_grid():
     """
     from xmitgcm import open_mdsdataset
     its = diag_iters()[:2].tolist()
-    ds = open_mdsdataset(RUN_DIR, grid_dir=GRID_DIR, iters=its,
+    ds = open_mdsdataset(GRID_DIR, grid_dir=GRID_DIR, iters=its,
                          prefix=['diag_state'], ref_date=REF_DATE,
                          delta_t=DELTA_T)
     xc = np.asarray(ds.XC.values); yc = np.asarray(ds.YC.values)
