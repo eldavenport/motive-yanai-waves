@@ -1,7 +1,7 @@
 """Depth-section mean & variance of the momentum fluxes u'w', v'w', u'v'.
 
-Two section orientations (matching the EDJ sections e2/e3):
-  lon-depth at the equator (nearest latitude to 0)
+Two section orientations:
+  lon-depth at 0.5 N (nearest latitude to SEC_LAT)
   lat-depth at 140 W
 
 For each model (tpose24, tpose6) and each band (total, yanai) a 2x3 figure is
@@ -36,6 +36,7 @@ import fluxes as fx
 
 REPO = '/home/edavenport/analysis/motive-yanai-waves'
 SEC_LON_W = 140.0           # lon (deg W) for the lat-depth section
+SEC_LAT = 0.5               # lat (deg N) for the lon-depth section
 SEC_ZMAX = 2500.0           # depth limit (m) for the sections
 N_LEVELS = 100
 FLUX_COLS = [('uw', r"$u'w'$"), ('vw', r"$v'w'$"), ('uv', r"$u'v'$")]
@@ -74,7 +75,7 @@ def stream_t24():
     lon, lat, Z, hFacC = g['lon'], g['lat'], g['Z'], g['hFacC']
     iters = io24.iters_after_spinup()
     nt, k = len(iters), io24.edge_trim_samples()
-    jeq = io24.nearest_idx(lat, 0.0)
+    jeq = io24.nearest_idx(lat, SEC_LAT)
     ix = io24.nearest_idx(lon, 360.0 - SEC_LON_W)
     rows = {f: np.empty((nt, io24.NZ, io24.NX), 'f4') for f in ('U', 'V', 'W')}
     cols = {f: np.empty((nt, io24.NZ, io24.NY), 'f4') for f in ('U', 'V', 'W')}
@@ -108,7 +109,7 @@ def stream_t6():
     g = io6.load_grid()
     lon, lat, Z, hFacC = g['lon'], g['lat'], g['Z'], g['hFacC']
     etm = io6.edge_trim_mask(io6.time_index())
-    jeq = io6.nearest_idx(lat, 0.0)
+    jeq = io6.nearest_idx(lat, SEC_LAT)
     ix = io6.nearest_idx(lon, 360.0 - SEC_LON_W)
 
     def read_plane(iy, ix_, horiz_axis, target_len):
@@ -129,7 +130,7 @@ def stream_t6():
             out[f] = a
         return out                                          # (time, nz, ns)
 
-    rows = read_plane(slice(jeq, jeq + 1), None, 2, len(lon))   # equator, all lon
+    rows = read_plane(slice(jeq, jeq + 1), None, 2, len(lon))   # 0.5N, all lon
     cols = read_plane(None, slice(ix, ix + 1), 3, len(lat))     # 140 W, all lat
     row = dict(Z=Z, x=lon, xlabel='lon (°E)',
                land=(hFacC[:, jeq, :] == 0.0), **rows)
@@ -153,12 +154,23 @@ def _cf(ax, x, z, F, cmap, levels, v):
     return cs
 
 
-def plot_section(sec, band, model, orient, out_dir):
-    """2x3 figure: rows mean/variance, cols u'w'/v'w'/u'v', for one section plane."""
-    mean, var = _flux_mean_var(sec['U'], sec['V'], sec['W'], sec['land'],
-                               band, sec['interior'], sec['dt_days'])
-    Z, x, xlabel = sec['Z'], sec['x'], sec['xlabel']
-    zmask = (-Z >= 0) & (-Z <= SEC_ZMAX)
+# depth ranges (zmin, zmax, zlab) per band; '' zlab = full column, no name suffix.
+# The yanai band also gets a 300-1400 m zoom whose colorbars rescale to the deep
+# signal (otherwise the strong surface/equatorial flux swamps the deep fluxes).
+SEC_RANGES = {
+    'total': [(0.0, SEC_ZMAX, '')],
+    'yanai': [(0.0, SEC_ZMAX, ''), (300.0, 1400.0, '300-1400m')],
+}
+
+
+def _draw_section(mean, var, Z, x, xlabel, zr, band, model, orient, out_dir):
+    """Draw one 2x3 mean/variance section figure over the depth range `zr`.
+
+    Colorbars auto-scale to the plotted depth range (98th pct), so a deep zoom
+    rescales to the deep fluxes/variance rather than the near-surface signal.
+    """
+    zmin, zmax, zlab = zr
+    zmask = (-Z >= zmin) & (-Z <= zmax)
     zz = Z[zmask]
 
     fig, axes = plt.subplots(2, 3, figsize=(16, 8.5), sharex=True, sharey=True,
@@ -183,22 +195,33 @@ def plot_section(sec, band, model, orient, out_dir):
         axes[1, cix].set_xlabel(xlabel)
     axes[0, 0].set_ylabel('mean $\\langle x\'y\'\\rangle$\ndepth (m)', fontsize=10)
     axes[1, 0].set_ylabel('variance Var$_t[x\'y\']$\ndepth (m)', fontsize=10)
-    axes[0, 0].set_ylim(-SEC_ZMAX, 0)
+    axes[0, 0].set_ylim(-zmax, -zmin)
+    zttl = f' — {zlab}' if zlab else ''
     fig.suptitle(f'{model} — momentum-flux {orient.replace("_", " ")} — '
-                 f'{band} — mean (top) & variance (bottom)')
+                 f'{band} — mean (top) & variance (bottom){zttl}')
     os.makedirs(out_dir, exist_ok=True)
-    fname = os.path.join(out_dir, f'flux_section_{orient}_{band}.png')
+    suffix = f'_{zlab}' if zlab else ''
+    fname = os.path.join(out_dir, f'flux_section_{orient}_{band}{suffix}.png')
     fig.savefig(fname, dpi=140)
     plt.close(fig)
     print('wrote', fname, flush=True)
     return fname
 
 
+def plot_section(sec, band, model, orient, out_dir):
+    """Mean/variance section figure(s) for one plane, one per SEC_RANGES[band]."""
+    mean, var = _flux_mean_var(sec['U'], sec['V'], sec['W'], sec['land'],
+                               band, sec['interior'], sec['dt_days'])
+    for zr in SEC_RANGES[band]:
+        _draw_section(mean, var, sec['Z'], sec['x'], sec['xlabel'],
+                      zr, band, model, orient, out_dir)
+
+
 MODELS = {
     'tpose24': dict(stream=stream_t24, fig_dir=f'{REPO}/figures/flux_sections'),
     'tpose6': dict(stream=stream_t6, fig_dir=f'{REPO}/figures/tpose6/flux_sections'),
 }
-ORIENTS = ['lon_depth_equator', 'lat_depth_140W']
+ORIENTS = ['lon_depth_0.5N', 'lat_depth_140W']
 
 
 def main(models=None):
