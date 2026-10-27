@@ -7,7 +7,7 @@ both the time-mean N^2 modes and the time-evolving N^2 modes can be built from o
 cache. Below-seafloor cells are left as read (0 for mds runs, NaN for TPOSE6 Vel);
 plot_deep_jets masks via hFacC from the mooring cache.
 
-Run:  python build_strat_cache.py [tpose24|tpose6|tpose6_noVel_5year ...]
+Run:  python build_strat_cache.py [tpose24|tpose6 ...]
 (TPOSE6 / 5-year read whole fields off NFS -- run those detached.)
 
 Output: <CACHE_DIR>/yanai_strat_<tag>.nc  (tag mirrors the mooring cache name)
@@ -74,14 +74,9 @@ def build(model):
     t0 = time.time()
     if model == 'tpose24':
         times, data = _read_tpose24(io, ii, jj)
-    elif model == 'tpose6':
+    else:  # tpose6
         times, data = _read_xarray(io, ii, jj,
                                    lambda v, iy, ix: io.load_var(v, iy=iy, ix=ix))
-        _ds = None
-    else:  # tpose6_noVel_5year
-        ds = io.open_5year()
-        times, data = _read_xarray(io, ii, jj, lambda v, iy, ix: ds[v].isel(
-            {io._hdim(ds[v])[0]: iy, io._hdim(ds[v])[1]: ix}))
     print(f'  read {FIELDS} in {time.time()-t0:.0f}s', flush=True)
 
     out = xr.Dataset(
